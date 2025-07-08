@@ -1,0 +1,14 @@
+.Rproj.user
+.Rhistory
+.RData
+.Ruserdata
+files_big
+figures
+files
+outputs
+*.html
+*.csv
+*.png
+*.jpg
+*.xlsx
+*.xls
