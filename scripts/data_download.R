@@ -322,8 +322,8 @@ options$filter_types  # See available filter types: 'Bulk GF/F', '20um', '3um', 
 # Method 1: 10th-90th percentile (recommended for phytoplankton)
 result_p10_90 <- run_chlorophyll_qc(data, 
                                     selected_depth = "5", 
-                                    selected_filter_type = "GF/F", 
-                                    investigation_year = 2021,
+                                    selected_filter_type = "Bulk GF/F", 
+                                    investigation_year = 2019,
                                     variability_method = "percentile_10_90")
 
 # # Method 2: 5th-95th percentile (even more inclusive)
