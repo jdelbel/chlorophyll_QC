@@ -18,6 +18,7 @@ library(quantreg)
 library(splines)
 library(purrr)
 library(tidyr)
+library(here)
 
 # Function to create improved chlorophyll QC plot with seasonal GAM
 create_improved_chlorophyll_qc_plot <- function(data, selected_depth, selected_filter_type, investigation_year, 
@@ -447,8 +448,8 @@ get_available_options <- function(data) {
 
 # Method 1: GAM with moving window quantiles (recommended)
 result_gam <- run_improved_chlorophyll_qc(data, 
-                                          selected_depth = "5", 
-                                          selected_filter_type = "3um", 
+                                          selected_depth = "10", 
+                                          selected_filter_type = "20um", 
                                           investigation_year = 2024,
                                           variability_method = "gam_quantiles",
                                           window_days = 14)
@@ -753,9 +754,267 @@ qc_metrics <- calculate_qc_metrics(result)
 
 test <- compare_year_qc(result, 2022)
 
+# --------------------
 
 
 
+
+
+
+
+
+
+
+
+
+# Function to perform basic chlorophyll QC checks
+perform_basic_chlorophyll_qc_checks <- function(data) {
+  
+  # Convert date to Date class if it isn't already
+  data <- data %>%
+    mutate(date = as.Date(date))
+  
+  # Check 1: Records with negative chlorophyll and/or phaeopigments
+  cat("=== CHECK 1: NEGATIVE VALUES ===\n")
+  negative_values <- data %>%
+    filter(chla < 0 | phaeo < 0 | (!is.na(chla) & !is.na(phaeo) & (chla < 0 | phaeo < 0))) %>%
+    select(hakai_id, site_id, line_out_depth, date, chla, phaeo, 
+           any_of(c("chla_flag", "phaeo_flag"))) %>%
+    arrange(date, site_id, line_out_depth)
+  
+  if (nrow(negative_values) > 0) {
+    cat("Found", nrow(negative_values), "records with negative chlorophyll and/or phaeopigments:\n")
+    print(negative_values)
+    
+    # Create issues directory if it doesn't exist
+    if (!dir.exists(here("issues"))) {
+      dir.create(here("issues"), recursive = TRUE)
+    }
+    
+    # Save to CSV
+    csv_filename <- here("issues", paste0("negative_values_", Sys.Date(), ".csv"))
+    write.csv(negative_values, csv_filename, row.names = FALSE)
+    cat("Negative values saved to:", csv_filename, "\n")
+  } else {
+    cat("No records with negative chlorophyll or phaeopigments found.\n")
+  }
+  cat("\n")
+  
+  # Check 2: Records with acid ratios < 1.01
+  cat("=== CHECK 2: LOW ACID RATIOS ===\n")
+  
+  # Calculate acid ratio if not already present
+  if (!"acid_ratio" %in% names(data)) {
+    if (all(c("before_acid", "after_acid") %in% names(data))) {
+      data <- data %>%
+        mutate(acid_ratio = before_acid / after_acid)
+      cat("Calculated acid_ratio from before_acid/after_acid\n")
+    } else {
+      cat("ERROR: Cannot find acid ratio data. Need either 'acid_ratio' column or 'before_acid' and 'after_acid' columns.\n")
+      cat("Available columns:", paste(names(data), collapse = ", "), "\n\n")
+      low_acid_ratios <- data.frame()
+    }
+  }
+  
+  if ("acid_ratio" %in% names(data) || all(c("before_acid", "after_acid") %in% names(data))) {
+    low_acid_ratios <- data %>%
+      filter(!is.na(acid_ratio) & acid_ratio < 1.01) %>%
+      select(hakai_id, site_id, line_out_depth, date, acid_ratio, 
+             any_of(c("before_acid", "after_acid", "chla", "phaeo", "chla_flag", "phaeo_flag"))) %>%
+      arrange(date, site_id, line_out_depth)
+    
+    if (nrow(low_acid_ratios) > 0) {
+      cat("Found", nrow(low_acid_ratios), "records with acid ratios < 1.01:\n")
+      print(low_acid_ratios)
+      
+      # Create issues directory if it doesn't exist
+      if (!dir.exists(here("issues"))) {
+        dir.create(here("issues"), recursive = TRUE)
+      }
+      
+      # Save to CSV
+      csv_filename <- here("issues", paste0("low_acid_ratios_", Sys.Date(), ".csv"))
+      write.csv(low_acid_ratios, csv_filename, row.names = FALSE)
+      cat("Low acid ratios saved to:", csv_filename, "\n")
+    } else {
+      cat("No records with acid ratios < 1.01 found.\n")
+    }
+  }
+  cat("\n")
+  
+  # Check 3: Calibration consistency check
+  cat("=== CHECK 3: CALIBRATION CONSISTENCY ===\n")
+  
+  # Define calibration-related columns to check
+  calibration_cols <- c("flurometer_serial_no", "calibration", "acid_ratio_correction_factor", 
+                        "acid_coefficient", "calibration_slope")
+  
+  # Check which calibration columns are available
+  available_cal_cols <- calibration_cols[calibration_cols %in% names(data)]
+  missing_cal_cols <- calibration_cols[!calibration_cols %in% names(data)]
+  
+  if (length(missing_cal_cols) > 0) {
+    cat("WARNING: Missing calibration columns:", paste(missing_cal_cols, collapse = ", "), "\n")
+  }
+  
+  if (length(available_cal_cols) > 0) {
+    cat("Checking calibration consistency for columns:", paste(available_cal_cols, collapse = ", "), "\n\n")
+    
+    # Check if we have flurometer_serial_no for grouping
+    if ("flurometer_serial_no" %in% available_cal_cols) {
+      
+      # Create calibration summary by fluorometer serial number - include analyzed dates
+      calibration_summary <- data %>%
+        filter(!is.na(date)) %>%
+        select(date, all_of(available_cal_cols), any_of("analyzed")) %>%
+        # Remove rows where all calibration values are NA
+        filter(if_all(all_of(available_cal_cols), ~ !is.na(.))) %>%
+        arrange(date) %>%
+        # Group by fluorometer serial number first, then by calibration parameters
+        group_by(flurometer_serial_no) %>%
+        nest() %>%
+        mutate(
+          calibration_periods = map(data, ~ {
+            summary_data <- .x %>%
+              group_by(across(all_of(available_cal_cols[available_cal_cols != "flurometer_serial_no"]))) %>%
+              summarise(
+                start_date = min(date, na.rm = TRUE),
+                end_date = max(date, na.rm = TRUE),
+                n_records = n(),
+                date_range = paste(min(date, na.rm = TRUE), "to", max(date, na.rm = TRUE)),
+                .groups = 'drop'
+              )
+            
+            # Add analyzed date columns if analyzed column exists
+            if ("analyzed" %in% names(.x)) {
+              summary_data <- .x %>%
+                group_by(across(all_of(available_cal_cols[available_cal_cols != "flurometer_serial_no"]))) %>%
+                summarise(
+                  start_date = min(date, na.rm = TRUE),
+                  end_date = max(date, na.rm = TRUE),
+                  start_analyzed = min(as.Date(analyzed), na.rm = TRUE),
+                  end_analyzed = max(as.Date(analyzed), na.rm = TRUE),
+                  n_records = n(),
+                  date_range = paste(min(date, na.rm = TRUE), "to", max(date, na.rm = TRUE)),
+                  analyzed_range = paste(min(as.Date(analyzed), na.rm = TRUE), "to", max(as.Date(analyzed), na.rm = TRUE)),
+                  .groups = 'drop'
+                )
+            }
+            
+            summary_data %>% arrange(if ("start_analyzed" %in% names(.)) start_analyzed else start_date)
+          })
+        ) %>%
+        select(-data) %>%
+        unnest(calibration_periods)
+      
+      if (nrow(calibration_summary) > 0) {
+        cat("Calibration periods by fluorometer serial number:\n")
+        
+        # Print summary for each fluorometer
+        for (serial_num in unique(calibration_summary$flurometer_serial_no)) {
+          cat("\n--- Fluorometer Serial Number:", serial_num, "---\n")
+          serial_data <- calibration_summary %>% filter(flurometer_serial_no == serial_num)
+          print(serial_data %>% select(-flurometer_serial_no))
+        }
+        
+        # Check for calibration date issues if calibration column exists
+        calibration_date_issues <- NULL
+        if ("calibration" %in% available_cal_cols && "analyzed" %in% names(data)) {
+          cat("\n=== CALIBRATION DATE VALIDATION ===\n")
+          
+          # Use the already computed calibration_summary for date validation
+          calibration_date_issues <- calibration_summary %>%
+            mutate(
+              calibration_date = as.Date(calibration, tryFormats = c("%Y-%m-%d", "%m/%d/%Y", "%d/%m/%Y")),
+              date_issue = !is.na(calibration_date) & start_analyzed < calibration_date
+            ) %>%
+            filter(date_issue == TRUE) %>%
+            select(flurometer_serial_no, calibration, calibration_date, start_analyzed, end_analyzed,
+                   start_date, end_date, n_records, everything())
+          
+          if (nrow(calibration_date_issues) > 0) {
+            cat("WARNING: Found", nrow(calibration_date_issues), "calibration periods where analyzed date is before calibration date:\n")
+            print(calibration_date_issues)
+            
+            # Create issues directory if it doesn't exist
+            if (!dir.exists(here("issues"))) {
+              dir.create(here("issues"), recursive = TRUE)
+            }
+            
+            # Save to CSV
+            csv_filename <- here("issues", paste0("calibration_date_issues_", Sys.Date(), ".csv"))
+            write.csv(calibration_date_issues, csv_filename, row.names = FALSE)
+            cat("Calibration date issues saved to:", csv_filename, "\n")
+            
+          } else {
+            cat("No calibration date issues found (analyzed dates are after calibration dates).\n")
+          }
+          
+        } else if ("calibration" %in% available_cal_cols && !"analyzed" %in% names(data)) {
+          cat("\n=== CALIBRATION DATE VALIDATION ===\n")
+          cat("WARNING: 'analyzed' column not found. Cannot perform calibration date validation.\n")
+          cat("Available date columns:", paste(names(data)[grepl("date|time|analyzed", names(data), ignore.case = TRUE)], collapse = ", "), "\n")
+        }
+        
+      } else {
+        cat("No complete calibration records found in the data.\n")
+      }
+      
+    } else {
+      cat("Cannot perform fluorometer-specific analysis: flurometer_serial_no column not found.\n")
+      calibration_summary <- data.frame()
+    }
+    
+  } else {
+    cat("No calibration columns found in the data.\n")
+    calibration_summary <- data.frame()
+  }
+  
+  # Summary statistics
+  cat("\n=== SUMMARY ===\n")
+  cat("Total records processed:", nrow(data), "\n")
+  cat("Records with negative values:", nrow(negative_values), "\n")
+  if (exists("low_acid_ratios")) {
+    cat("Records with low acid ratios:", nrow(low_acid_ratios), "\n")
+  }
+  if (exists("calibration_summary")) {
+    cat("Distinct calibration combinations:", nrow(calibration_summary), "\n")
+  }
+  
+  # Return results as a list
+  results <- list(
+    negative_values = negative_values,
+    summary_stats = list(
+      total_records = nrow(data),
+      negative_records = nrow(negative_values)
+    )
+  )
+  
+  if (exists("low_acid_ratios")) {
+    results$low_acid_ratios <- low_acid_ratios
+    results$summary_stats$low_acid_ratio_records <- nrow(low_acid_ratios)
+  }
+  
+  if (exists("calibration_summary")) {
+    results$calibration_summary <- calibration_summary
+    results$summary_stats$calibration_combinations <- nrow(calibration_summary)
+  }
+  
+  if (exists("calibration_date_issues") && !is.null(calibration_date_issues)) {
+    results$calibration_date_issues <- calibration_date_issues
+    results$summary_stats$calibration_date_issues <- nrow(calibration_date_issues)
+  }
+  
+  return(results)
+}
+
+
+# Example usage:
+qc_results <- perform_basic_chlorophyll_qc_checks(data)
+# 
+# # Access specific results:
+negative_values <- qc_results$negative_values
+calibration_summary <- qc_results$calibration_summary
 
 
 
