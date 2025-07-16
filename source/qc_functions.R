@@ -1,25 +1,3 @@
-library(hakaiApi)
-
-# Initialize the client
-client <- Client$new()
-
-#Setting up Query
-endpoint <- "/eims/views/output/chlorophyll"
-filter <- "site_id=QU39"
-chl_url <- paste0("https://hecate.hakai.org/api", endpoint,"?limit=-1&", filter)
-data <- client$get(chl_url)
-
-
-library(plotly)
-library(dplyr)
-library(lubridate)
-library(mgcv)
-library(quantreg)
-library(splines)
-library(purrr)
-library(tidyr)
-library(here)
-
 # Function to create improved chlorophyll QC plot with seasonal GAM
 create_improved_chlorophyll_qc_plot <- function(data, selected_depth, selected_filter_type, investigation_year, 
                                                 variability_method = "gam_quantiles", window_days = 14) {
@@ -441,47 +419,6 @@ get_available_options <- function(data) {
 
 # ----------------------------------------------------------------------------
 
-
-
-
-# Example usage:
-
-# Method 1: GAM with moving window quantiles (recommended)
-result_gam <- run_improved_chlorophyll_qc(data, 
-                                          selected_depth = "10", 
-                                          selected_filter_type = "20um", 
-                                          investigation_year = 2024,
-                                          variability_method = "gam_quantiles",
-                                          window_days = 14)
-
-# -------------------------------------------------------------------------
-
-
-# Method 3: Compare with original weekly method
-# result_weekly <- run_improved_chlorophyll_qc(data, 
-#                                              selected_depth = "5", 
-#                                              selected_filter_type = "Bulk GF/F", 
-#                                              investigation_year = 2024,
-#                                              variability_method = "weekly")
-#--------------------------------------------------------------------------
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-#--------------------------------------
-
-
-
 # Function to sum size-fractions and compare to bulk
 sum_size_fractions <- function(df) {
   
@@ -541,7 +478,7 @@ sum_size_fractions <- function(df) {
 }
 
 # Example usage (assuming your data frame is called 'chla_data'):
-result <- sum_size_fractions(data)
+# result <- sum_size_fractions(data)
 # 
 # # View summary
 # summary(result)
@@ -755,24 +692,7 @@ compare_year_qc <- function(comparison_data, selected_year) {
   return(metrics)
 }
 
-# Example plotting:
-# plot_bulk_vs_sum(result)
-
-# NEW USAGE EXAMPLES:
-# 
-# # 1. Interactive plot with hover information
-plot_bulk_vs_sum_interactive(result)
-# 
-# 2. Interactive plot highlighting a specific year
-plot_bulk_vs_sum_interactive(result, selected_year = 2024)
-# 
-# # 3. Calculate QC metrics for all years
-qc_metrics <- calculate_qc_metrics(result)
-
-test <- compare_year_qc(result, 2022)
-
-
-#------------------
+# -----------------------------------------------------------------------------
 
 
 # Function to perform basic chlorophyll QC checks
@@ -1129,25 +1049,8 @@ perform_basic_chlorophyll_qc_checks <- function(data) {
   return(results)
 }
 
+#---------------------------------------------------------------------------
 
-
-
-
-
-
-
-# Example usage:
-qc_results <- perform_basic_chlorophyll_qc_checks(data)
-# 
-# # Access specific results:
-negative_values <- qc_results$negative_values
-low_acid_ratios <- qc_results$low_acid_ratios
-missing_fractions <- qc_results$missing_fractions
-replicated_ids <- qc_results$replicated_ids
-calibration_summary <- qc_results$calibration_summary
-calibration_date_issues <- qc_results$calibration_date_issues
-
-# -----------------------
 
 # Function to create interactive monthly box plots for outlier detection
 create_monthly_boxplot_qc <- function(data, selected_depth = NULL, selected_filter_type = NULL, investigation_year = NULL, 
@@ -1410,11 +1313,4 @@ create_monthly_boxplot_qc <- function(data, selected_depth = NULL, selected_filt
   return(list(plot = p, outlier_data = investigation_with_outliers, monthly_stats = monthly_stats))
 }
 
-create_monthly_boxplot_qc( 
-  data = data,
-  selected_depth = 5,
-  selected_filter_type = "GF/F",
-  investigation_year = 2023,
-  variable = "acid_ratio",
-  outlier_method = "IQR"
-)
+

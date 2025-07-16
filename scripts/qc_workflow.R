@@ -1,0 +1,81 @@
+
+#Load packages
+library(hakaiApi)
+library(plotly)
+library(dplyr)
+library(lubridate)
+library(mgcv)
+library(quantreg)
+library(splines)
+library(purrr)
+library(tidyr)
+library(here)
+
+# Source functions
+source(here("source", "qc_functions.R"))
+
+#Download data using the API
+
+# Initialize the client
+client <- Client$new()
+
+#Setting up Query
+endpoint <- "/eims/views/output/chlorophyll"
+filter <- "site_id=QU39"
+chl_url <- paste0("https://hecate.hakai.org/api", endpoint,"?limit=-1&", filter)
+data <- client$get(chl_url)
+
+
+# --------------------- Basic QC Checks--------------------------------------
+
+#Run basic QC checks and balances
+
+#Looks for a variety of errors included negative values, low acid ratios, missing size fractions, duplicated IDs and incorrect calibrations
+qc_results <- perform_basic_chlorophyll_qc_checks(data)
+# 
+# # Access specific results:
+negative_values <- qc_results$negative_values
+low_acid_ratios <- qc_results$low_acid_ratios
+missing_fractions <- qc_results$missing_fractions
+replicated_ids <- qc_results$replicated_ids
+calibration_summary <- qc_results$calibration_summary
+calibration_date_issues <- qc_results$calibration_date_issues
+
+# -----------------------------------
+
+#Run interactive plot to look at QC data incomparison to time series for each depth and filter type
+
+# Method 1: GAM with moving window quantiles (recommended)
+result_gam <- run_improved_chlorophyll_qc(data, 
+                                          selected_depth = "10", 
+                                          selected_filter_type = "20um", 
+                                          investigation_year = 2024,
+                                          variability_method = "gam_quantiles",
+                                          window_days = 14)
+
+# Method 3: Compare with original weekly method
+result_weekly <- run_improved_chlorophyll_qc(data,
+                                             selected_depth = "5",
+                                             selected_filter_type = "Bulk GF/F",
+                                             investigation_year = 2024,
+                                             variability_method = "weekly")
+
+result_monthly_boxplot <- create_monthly_boxplot_qc( 
+  data = data,
+  selected_depth = 5,
+  selected_filter_type = "GF/F",
+  investigation_year = 2023,
+  variable = "acid_ratio",
+  outlier_method = "IQR"
+)
+
+# -----------------------------------------------------
+
+#Run size-fraction sum versus bulk plotting and creation of annual statistics
+
+# Interactive plot highlighting a specific year
+plot_bulk_vs_sum_interactive(data, selected_year = 2024)
+# 
+# # 3. Calculate QC metrics for all years
+qc_metrics <- calculate_qc_metrics(data)
+
