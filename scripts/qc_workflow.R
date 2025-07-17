@@ -71,11 +71,35 @@ result_monthly_boxplot <- create_monthly_boxplot_qc(
 
 # -----------------------------------------------------
 
-#Run size-fraction sum versus bulk plotting and creation of annual statistics
+# Run complete QC workflow
+sf_qc_results <- run_complete_qc(data)
 
-# Interactive plot highlighting a specific year
-plot_bulk_vs_sum_interactive(data, selected_year = 2024)
+# Plot specific year with outlier highlighting (default)
+plot_bulk_vs_sum_interactive(sf_qc_results, selected_year = 2024,
+                             highlight_outliers = TRUE)
+
+# -----------------------
+
+create_monthly_boxplot_qc(data,
+                                    selected_depth = 100,
+                                    selected_filter_type = "Bulk GF/F",
+                                    investigation_year = 2024,
+                                    variable = "acid_ratio",
+                                    show_outliers = TRUE,
+                                    outlier_method = "iqr")
+
+
+
+
+# Required:
+#   
+# data - Your dataset containing the phytoplankton/chlorophyll data
 # 
-# # 3. Calculate QC metrics for all years
-qc_metrics <- calculate_qc_metrics(data)
-
+# Optional parameters (with defaults):
+#   
+# selected_depth - Water depth in meters (defaults to first available depth)
+# selected_filter_type - Filter type (defaults to "GF/F" if available, otherwise first available)
+# investigation_year - Year to investigate for outliers (defaults to most recent year)
+# variable - Either "chla" or "acid_ratio" (defaults to "chla")
+# show_outliers - TRUE/FALSE (defaults to TRUE)
+# outlier_method - Either "iqr" or "quantile" (defaults to "iqr")

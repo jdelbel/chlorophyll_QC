@@ -419,21 +419,39 @@ get_available_options <- function(data) {
 
 # ----------------------------------------------------------------------------
 
-# Function to sum size-fractions and compare to bulk
+# Enhanced function to sum size-fractions and compare to bulk with acid ratio QC
 sum_size_fractions <- function(df) {
   
   # Check if required columns exist
   required_cols <- c("date", "site_id", "line_out_depth", "hakai_id", 
-                     "collected", "filter_type", "chla", "chla_flag")
+                     "collected", "filter_type", "chla", "chla_flag",
+                     "before_acid", "after_acid")
   missing_cols <- setdiff(required_cols, names(df))
   if(length(missing_cols) > 0) {
     stop(paste("Missing required columns:", paste(missing_cols, collapse = ", ")))
+  }
+  
+  # Create issues folder if it doesn't exist
+  if(!dir.exists("issues")) {
+    dir.create("issues")
   }
   
   # Define size classes, bulk, and bad flags
   size_classes <- c("20um", "3um", "GF/F")
   bulk_class <- "Bulk GF/F"
   bad_flags <- c("SVD")
+  
+  # Calculate acid ratios for all data
+  df <- df %>%
+    mutate(
+      acid_ratio = before_acid / after_acid,
+      acid_ratio_flag = case_when(
+        is.na(acid_ratio) ~ "Missing",
+        acid_ratio < 1.1 ~ "Low",
+        acid_ratio > 2.0 ~ "High",
+        TRUE ~ "OK"
+      )
+    )
   
   # Filter out bad quality data and split into size classes
   size_data <- df %>%
@@ -448,15 +466,20 @@ sum_size_fractions <- function(df) {
       chla_sum = if_else(n() == 3, sum(chla, na.rm = TRUE), NA_real_),
       # Track if we have complete size fraction set
       complete_set = n() == 3,
+      # Check for any problematic acid ratios in size fractions
+      any_bad_acid_ratio = any(acid_ratio_flag %in% c("Low", "High")),
+      bad_acid_details = paste(filter_type[acid_ratio_flag %in% c("Low", "High")], 
+                               collapse = ", "),
       .groups = "drop"
     )
   
-  # Get bulk measurements (excluding bad quality)
+  # Get bulk measurements (excluding bad quality) with acid ratio info
   bulk_data <- df %>%
     filter(filter_type == bulk_class) %>%
     filter(!chla_flag %in% bad_flags) %>%  # Remove bad quality bulk measurements
     select(collected, date, site_id, line_out_depth, 
-           chla_bulk = chla, chla_bulk_flag = chla_flag, hakai_id)
+           chla_bulk = chla, chla_bulk_flag = chla_flag, hakai_id,
+           bulk_acid_ratio = acid_ratio, bulk_acid_ratio_flag = acid_ratio_flag)
   
   # Join size fraction sums with bulk measurements
   comparison_data <- size_data %>%
@@ -471,38 +494,162 @@ sum_size_fractions <- function(df) {
       chla_ratio = if_else(complete_set & !is.na(chla_bulk) & chla_bulk > 0, 
                            chla_sum / chla_bulk, NA_real_),
       percent_diff = if_else(complete_set & !is.na(chla_bulk) & chla_bulk > 0, 
-                             ((chla_sum - chla_bulk) / chla_bulk) * 100, NA_real_)
+                             ((chla_sum - chla_bulk) / chla_bulk) * 100, NA_real_),
+      # Combined acid ratio flag (bad if ANY filter type has bad acid ratio)
+      combined_acid_flag = case_when(
+        any_bad_acid_ratio | bulk_acid_ratio_flag %in% c("Low", "High") ~ "Bad",
+        TRUE ~ "OK"
+      )
     )
   
   return(comparison_data)
 }
 
-# Example usage (assuming your data frame is called 'chla_data'):
-# result <- sum_size_fractions(data)
-# 
-# # View summary
-# summary(result)
-# 
-# # Check for missing bulk measurements
-# missing_bulk <- result %>% filter(is.na(chla_bulk))
-# if(nrow(missing_bulk) > 0) {
-#   cat("Warning:", nrow(missing_bulk), "size-fraction sets have no corresponding bulk measurement\n")
-# }
-# 
-# # Check for incomplete size-fraction sets (should have 3 size classes)
-# incomplete_sets <- result %>% filter(!complete_set)
-# if(nrow(incomplete_sets) > 0) {
-#   cat("Warning:", nrow(incomplete_sets), "sets have fewer than 3 good-quality size fractions\n")
-#   print(incomplete_sets %>% select(collected, site_id, n_size_fractions, size_classes_present))
-# }
-# 
-# # Check how many samples have valid comparisons
-# valid_comparisons <- result %>% filter(!is.na(chla_diff))
-# cat("Valid bulk vs sum comparisons:", nrow(valid_comparisons), "out of", nrow(result), "total sample sets\n")
+# Function to detect outliers using residuals
+detect_outliers <- function(comparison_data, residual_threshold = 2.5) {
+  
+  # Filter to valid comparisons
+  valid_data <- comparison_data %>%
+    filter(!is.na(chla_diff) & complete_set)
+  
+  if(nrow(valid_data) < 10) {
+    warning("Insufficient data for outlier detection (need at least 10 points)")
+    return(comparison_data %>% mutate(outlier_flag = "Insufficient_data",
+                                      high_confidence_outlier = FALSE))
+  }
+  
+  # Fit regression model
+  model <- lm(chla_sum ~ chla_bulk, data = valid_data)
+  
+  # Calculate residuals and standardized residuals
+  valid_data <- valid_data %>%
+    mutate(
+      predicted = predict(model, newdata = .),
+      residual = chla_sum - predicted,
+      standardized_residual = residual / sd(residual, na.rm = TRUE)
+    )
+  
+  # Flag outliers based on standardized residuals
+  valid_data <- valid_data %>%
+    mutate(
+      outlier_flag = case_when(
+        abs(standardized_residual) > residual_threshold ~ "Outlier",
+        TRUE ~ "Normal"
+      ),
+      # High confidence outlier: outlier AND bad acid ratio
+      high_confidence_outlier = outlier_flag == "Outlier" & combined_acid_flag == "Bad"
+    )
+  
+  # Join back with original data
+  result <- comparison_data %>%
+    left_join(
+      valid_data %>% select(collected, date, site_id, line_out_depth, 
+                            predicted, residual, standardized_residual, 
+                            outlier_flag, high_confidence_outlier),
+      by = c("collected", "date", "site_id", "line_out_depth")
+    ) %>%
+    mutate(
+      outlier_flag = if_else(is.na(outlier_flag), "No_comparison", outlier_flag),
+      high_confidence_outlier = if_else(is.na(high_confidence_outlier), FALSE, high_confidence_outlier)
+    )
+  
+  return(result)
+}
 
-# Interactive visualization function for QC
-# Interactive visualization function for QC
-plot_bulk_vs_sum_interactive <- function(comparison_data, selected_year = NULL) {
+# Function to export problematic samples to issues folder
+export_problem_samples <- function(comparison_data, original_df) {
+  
+  # Create timestamp for filename
+  timestamp <- format(Sys.time(), "%Y%m%d_%H%M%S")
+  
+  # Function to get size fraction hakai_ids for problematic samples
+  get_size_fraction_ids <- function(problem_data) {
+    if(nrow(problem_data) == 0) return(problem_data)
+    
+    # Get the size fraction hakai_ids for each problematic sample
+    size_fraction_ids <- problem_data %>%
+      left_join(
+        original_df %>%
+          filter(filter_type %in% c("20um", "3um", "GF/F")) %>%
+          group_by(collected, date, site_id, line_out_depth) %>%
+          summarise(
+            size_fraction_hakai_ids = paste(hakai_id, collapse = "; "),
+            .groups = "drop"
+          ),
+        by = c("collected", "date", "site_id", "line_out_depth")
+      ) %>%
+      # Keep both bulk and size fraction IDs for reference
+      rename(bulk_hakai_id = hakai_id) %>%
+      select(collected, date, site_id, line_out_depth, year, 
+             bulk_hakai_id, size_fraction_hakai_ids, everything())
+    
+    return(size_fraction_ids)
+  }
+  
+  # High confidence outliers
+  high_conf_outliers <- comparison_data %>%
+    filter(high_confidence_outlier == TRUE) %>%
+    arrange(date, site_id, line_out_depth) %>%
+    get_size_fraction_ids()
+  
+  if(nrow(high_conf_outliers) > 0) {
+    write.csv(high_conf_outliers, 
+              file = paste0("issues/sf_qc_high_confidence_outliers_", timestamp, ".csv"),
+              row.names = FALSE)
+    cat("Exported", nrow(high_conf_outliers), "high confidence outliers to issues folder\n")
+  }
+  
+  # All outliers (for reference)
+  all_outliers <- comparison_data %>%
+    filter(outlier_flag == "Outlier") %>%
+    arrange(date, site_id, line_out_depth) %>%
+    get_size_fraction_ids()
+  
+  if(nrow(all_outliers) > 0) {
+    write.csv(all_outliers, 
+              file = paste0("issues/sf_qc_all_outliers_", timestamp, ".csv"),
+              row.names = FALSE)
+    cat("Exported", nrow(all_outliers), "total outliers to issues folder\n")
+  }
+  
+  # Samples with bad acid ratios (regardless of outlier status)
+  bad_acid_samples <- comparison_data %>%
+    filter(combined_acid_flag == "Bad") %>%
+    arrange(date, site_id, line_out_depth) %>%
+    get_size_fraction_ids()
+  
+  if(nrow(bad_acid_samples) > 0) {
+    write.csv(bad_acid_samples, 
+              file = paste0("issues/sf_qc_bad_acid_ratios_", timestamp, ".csv"),
+              row.names = FALSE)
+    cat("Exported", nrow(bad_acid_samples), "samples with bad acid ratios to issues folder\n")
+  }
+  
+  # Summary report
+  summary_report <- data.frame(
+    Category = c("Total samples", "Valid comparisons", "Outliers", 
+                 "Bad acid ratios", "High confidence outliers"),
+    Count = c(nrow(comparison_data),
+              nrow(comparison_data %>% filter(outlier_flag %in% c("Outlier", "Normal"))),
+              nrow(all_outliers),
+              nrow(bad_acid_samples),
+              nrow(high_conf_outliers)),
+    Percentage = c(100,
+                   round(nrow(comparison_data %>% filter(outlier_flag %in% c("Outlier", "Normal"))) / nrow(comparison_data) * 100, 1),
+                   round(nrow(all_outliers) / nrow(comparison_data) * 100, 1),
+                   round(nrow(bad_acid_samples) / nrow(comparison_data) * 100, 1),
+                   round(nrow(high_conf_outliers) / nrow(comparison_data) * 100, 1))
+  )
+  
+  write.csv(summary_report, 
+            file = paste0("issues/sf_qc_summary_", timestamp, ".csv"),
+            row.names = FALSE)
+  
+  return(summary_report)
+}
+
+# Enhanced interactive plotting function with outlier highlighting
+plot_bulk_vs_sum_interactive <- function(comparison_data, selected_year = NULL, highlight_outliers = TRUE) {
   library(plotly)
   library(ggplot2)
   
@@ -523,6 +670,40 @@ plot_bulk_vs_sum_interactive <- function(comparison_data, selected_year = NULL) 
                                   "Other years"))
   } else {
     plot_data$year_group <- "All data"
+  }
+  
+  # Create point colors and shapes based on year AND outlier status
+  if(!is.null(selected_year)) {
+    # When year is selected, prioritize year grouping with outlier overlay
+    plot_data <- plot_data %>%
+      mutate(
+        point_color = year_group,
+        point_shape = case_when(
+          high_confidence_outlier == TRUE ~ "High Confidence Outlier",
+          outlier_flag == "Outlier" ~ "Outlier", 
+          combined_acid_flag == "Bad" ~ "Bad Acid Ratio",
+          TRUE ~ "Normal"
+        ),
+        point_size = case_when(
+          high_confidence_outlier == TRUE ~ 4,
+          outlier_flag == "Outlier" ~ 3,
+          combined_acid_flag == "Bad" ~ 2.5,
+          TRUE ~ 2
+        )
+      )
+  } else {
+    # When no year selected, use outlier status for coloring
+    plot_data <- plot_data %>%
+      mutate(
+        point_color = case_when(
+          high_confidence_outlier == TRUE ~ "High Confidence Outlier",
+          outlier_flag == "Outlier" ~ "Outlier",
+          combined_acid_flag == "Bad" ~ "Bad Acid Ratio",
+          TRUE ~ "Normal"
+        ),
+        point_shape = "Normal",
+        point_size = 2
+      )
   }
   
   # Calculate regression for full dataset
@@ -547,7 +728,7 @@ plot_bulk_vs_sum_interactive <- function(comparison_data, selected_year = NULL) 
     labs(
       x = "Bulk Chlorophyll-a (mg/m³)",
       y = "Sum of Size Fractions (mg/m³)",
-      title = "Interactive Bulk vs Sum of Size Fractions QC Plot"
+      title = "Interactive Bulk vs Sum QC Plot with Outlier Detection"
     ) +
     theme_minimal()
   
@@ -559,28 +740,53 @@ plot_bulk_vs_sum_interactive <- function(comparison_data, selected_year = NULL) 
   }
   
   # Add points with hover information
-  p <- p + geom_point(aes(text = paste("Hakai ID:", hakai_id,
-                                       "<br>Date:", date,
-                                       "<br>Site:", site_id,
-                                       "<br>Depth:", line_out_depth, "m",
-                                       "<br>Year:", year,
-                                       "<br>Bulk:", round(chla_bulk, 3),
-                                       "<br>Sum:", round(chla_sum, 3),
-                                       "<br>% Diff:", round(percent_diff, 1)),
-                          color = if(!is.null(selected_year)) year_group else NULL),
-                      alpha = 0.9)
+  hover_text <- paste("Hakai ID:", plot_data$hakai_id,
+                      "<br>Date:", plot_data$date,
+                      "<br>Site:", plot_data$site_id,
+                      "<br>Depth:", plot_data$line_out_depth, "m",
+                      "<br>Year:", plot_data$year,
+                      "<br>Bulk:", round(plot_data$chla_bulk, 3),
+                      "<br>Sum:", round(plot_data$chla_sum, 3),
+                      "<br>% Diff:", round(plot_data$percent_diff, 1),
+                      "<br>Outlier:", plot_data$outlier_flag,
+                      "<br>Acid Flag:", plot_data$combined_acid_flag)
   
-  # Add colors if year is selected
+  # Add points with appropriate styling
   if(!is.null(selected_year)) {
-    p <- p + scale_color_manual(values = c("grey50", "darkred")) +
-      labs(color = "Year Group")
+    # Create named vector for colors dynamically
+    year_label <- paste("Year", selected_year)
+    color_values <- c("grey50", "darkred")
+    names(color_values) <- c("Other years", year_label)
+    
+    p <- p + geom_point(aes(color = point_color, 
+                            shape = point_shape, 
+                            size = point_size,
+                            text = hover_text), 
+                        alpha = 0.8) +
+      scale_color_manual(values = color_values) +
+      scale_shape_manual(values = c("Normal" = 16, 
+                                    "Bad Acid Ratio" = 17,
+                                    "Outlier" = 4, 
+                                    "High Confidence Outlier" = 8)) +
+      scale_size_identity() +
+      labs(color = "Year Group", shape = "QC Status")
   } else {
-    p <- p + scale_color_manual(values = "steelblue")
+    # Outlier-based coloring
+    p <- p + geom_point(aes(color = point_color, text = hover_text), 
+                        alpha = 0.8, size = 2) +
+      scale_color_manual(values = c("Normal" = "steelblue", 
+                                    "Bad Acid Ratio" = "orange",
+                                    "Outlier" = "red", 
+                                    "High Confidence Outlier" = "darkred")) +
+      labs(color = "Sample Status")
   }
   
   # Add regression info to subtitle
   r2_full <- summary(full_lm)$r.squared
   slope_full <- coef(full_lm)[2]
+  
+  outlier_count <- sum(plot_data$outlier_flag == "Outlier", na.rm = TRUE)
+  high_conf_count <- sum(plot_data$high_confidence_outlier == TRUE, na.rm = TRUE)
   
   subtitle_text <- paste0("Full dataset: R² = ", round(r2_full, 3), 
                           ", Slope = ", round(slope_full, 3))
@@ -593,103 +799,44 @@ plot_bulk_vs_sum_interactive <- function(comparison_data, selected_year = NULL) 
                             ", Slope = ", round(slope_year, 3))
   }
   
+  subtitle_text <- paste0(subtitle_text, " | Outliers: ", outlier_count,
+                          " | High Confidence: ", high_conf_count)
+  
   p <- p + labs(subtitle = subtitle_text)
   
-  # Convert to interactive plot with better dimensions
-  ggplotly(p, tooltip = "text", height = 600, width = 700)
+  # Convert to interactive plot
+  ggplotly(p, tooltip = "text", height = 600, width = 800)
 }
 
-# QC metrics function
-calculate_qc_metrics <- function(comparison_data) {
-  # Filter to valid comparisons
-  valid_data <- comparison_data %>%
-    filter(!is.na(chla_diff) & complete_set)
+# Complete workflow function
+run_complete_qc <- function(df, residual_threshold = 2.5, export_issues = TRUE) {
   
-  if(nrow(valid_data) == 0) {
-    warning("No valid data for QC metrics")
-    return(NULL)
+  cat("=== RUNNING COMPLETE QC WORKFLOW ===\n\n")
+  
+  # Step 1: Calculate size fraction sums and basic QC
+  cat("Step 1: Calculating size fraction sums and acid ratios...\n")
+  comparison_data <- sum_size_fractions(df)
+  
+  # Step 2: Detect outliers
+  cat("Step 2: Detecting outliers...\n")
+  comparison_data <- detect_outliers(comparison_data, residual_threshold)
+  
+  # Step 3: Export problem samples
+  if(export_issues) {
+    cat("Step 3: Exporting problem samples...\n")
+    summary_report <- export_problem_samples(comparison_data, df)
+    print(summary_report)
   }
   
-  # Overall metrics
-  overall_metrics <- valid_data %>%
-    summarise(
-      n_samples = n(),
-      mean_ratio = mean(chla_ratio, na.rm = TRUE),
-      sd_ratio = sd(chla_ratio, na.rm = TRUE),
-      median_ratio = median(chla_ratio, na.rm = TRUE),
-      mad_ratio = mad(chla_ratio, na.rm = TRUE),
-      mean_percent_diff = mean(percent_diff, na.rm = TRUE),
-      sd_percent_diff = sd(percent_diff, na.rm = TRUE),
-      # Regression metrics
-      r_squared = cor(chla_bulk, chla_sum, use = "complete.obs")^2,
-      slope = coef(lm(chla_sum ~ chla_bulk, data = .))[2],
-      intercept = coef(lm(chla_sum ~ chla_bulk, data = .))[1],
-      rmse = sqrt(mean((chla_sum - chla_bulk)^2, na.rm = TRUE))
-    ) %>%
-    mutate(period = "Full time series")
+  # Step 4: Print summary
+  cat("\n=== QC SUMMARY ===\n")
+  cat("Total samples processed:", nrow(comparison_data), "\n")
+  cat("Valid comparisons:", sum(!is.na(comparison_data$chla_diff) & comparison_data$complete_set), "\n")
+  cat("Outliers detected:", sum(comparison_data$outlier_flag == "Outlier", na.rm = TRUE), "\n")
+  cat("High confidence outliers:", sum(comparison_data$high_confidence_outlier == TRUE, na.rm = TRUE), "\n")
+  cat("Samples with bad acid ratios:", sum(comparison_data$combined_acid_flag == "Bad", na.rm = TRUE), "\n")
   
-  # Yearly metrics
-  yearly_metrics <- valid_data %>%
-    group_by(year) %>%
-    summarise(
-      n_samples = n(),
-      mean_ratio = mean(chla_ratio, na.rm = TRUE),
-      sd_ratio = sd(chla_ratio, na.rm = TRUE),
-      median_ratio = median(chla_ratio, na.rm = TRUE),
-      mad_ratio = mad(chla_ratio, na.rm = TRUE),
-      mean_percent_diff = mean(percent_diff, na.rm = TRUE),
-      sd_percent_diff = sd(percent_diff, na.rm = TRUE),
-      # Regression metrics (if enough data)
-      r_squared = if_else(n() >= 3, cor(chla_bulk, chla_sum, use = "complete.obs")^2, NA_real_),
-      slope = if_else(n() >= 3, coef(lm(chla_sum ~ chla_bulk))[2], NA_real_),
-      intercept = if_else(n() >= 3, coef(lm(chla_sum ~ chla_bulk))[1], NA_real_),
-      rmse = sqrt(mean((chla_sum - chla_bulk)^2, na.rm = TRUE)),
-      .groups = "drop"
-    ) %>%
-    mutate(period = paste("Year", year))
-  
-  # Combine results
-  all_metrics <- bind_rows(overall_metrics, yearly_metrics)
-  
-  return(all_metrics)
-}
-
-# QC comparison function
-compare_year_qc <- function(comparison_data, selected_year) {
-  metrics <- calculate_qc_metrics(comparison_data)
-  
-  if(is.null(metrics)) return(NULL)
-  
-  overall <- metrics %>% filter(period == "Full time series")
-  year_data <- metrics %>% filter(period == paste("Year", selected_year))
-  
-  if(nrow(year_data) == 0) {
-    cat("No data available for year", selected_year, "\n")
-    return(NULL)
-  }
-  
-  cat("=== QC COMPARISON FOR YEAR", selected_year, "===\n\n")
-  
-  cat("Sample sizes:\n")
-  cat("  Full time series:", overall$n_samples, "samples\n")
-  cat("  Year", selected_year, ":", year_data$n_samples, "samples\n\n")
-  
-  cat("Bulk vs Sum Ratio (ideally ~1.0):\n")
-  cat("  Full series - Mean:", round(overall$mean_ratio, 3), "±", round(overall$sd_ratio, 3), "\n")
-  cat("  Year", selected_year, "- Mean:", round(year_data$mean_ratio, 3), "±", round(year_data$sd_ratio, 3), "\n")
-  cat("  Difference from overall:", round(year_data$mean_ratio - overall$mean_ratio, 3), "\n\n")
-  
-  cat("Percent Difference:\n")
-  cat("  Full series - Mean:", round(overall$mean_percent_diff, 1), "%\n")
-  cat("  Year", selected_year, "- Mean:", round(year_data$mean_percent_diff, 1), "%\n\n")
-  
-  cat("Regression Metrics:\n")
-  cat("  Full series - R²:", round(overall$r_squared, 3), "Slope:", round(overall$slope, 3), "\n")
-  if(!is.na(year_data$r_squared)) {
-    cat("  Year", selected_year, "- R²:", round(year_data$r_squared, 3), "Slope:", round(year_data$slope, 3), "\n")
-  }
-  
-  return(metrics)
+  return(comparison_data)
 }
 
 # -----------------------------------------------------------------------------
