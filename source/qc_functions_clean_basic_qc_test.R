@@ -1,13 +1,14 @@
-# Function to create improved chlorophyll QC plot with seasonal GAM
-create_improved_chlorophyll_qc_plot <- function(data, selected_depth, selected_filter_type, investigation_year, 
-                                                variability_method = "gam_quantiles", window_days = 14) {
+# Streamlined chlorophyll QC function with seasonal GAM
+create_chlorophyll_qc_plot <- function(data, selected_depth, selected_filter_type, 
+                                       investigation_year, variability_method = "gam_quantiles", 
+                                       window_days = 14) {
   
-  # Filter data for selected depth and filter type
+  # Filter and prepare data
   depth_data <- data %>%
     filter(line_out_depth == selected_depth,
            filter_type == selected_filter_type,
-           !is.na(chla),
-           !is.na(date)) %>%
+           !is.na(chla), !is.na(date),
+           chla_flag != "SVD" | is.na(chla_flag)) %>%
     mutate(
       date = as.Date(date),
       chla = as.numeric(chla),
@@ -16,29 +17,24 @@ create_improved_chlorophyll_qc_plot <- function(data, selected_depth, selected_f
       chla_flag = as.logical(chla_flag)
     )
   
-  # Debug information
-  cat("Debug: Filtered data has", nrow(depth_data), "rows\n")
-  cat("Debug: Year range:", min(depth_data$year, na.rm = TRUE), "to", max(depth_data$year, na.rm = TRUE), "\n")
+  if (nrow(depth_data) < 20) {
+    stop("Insufficient data (< 20 points). Need more historical data.")
+  }
   
-  # Separate baseline and investigation data
+  # Split data
   baseline_data <- depth_data %>%
     filter(year != investigation_year) %>%
     mutate(
-      log_chla = log(chla + 0.01),  # Small offset to handle zeros
+      log_chla = log(chla + 0.01),
       cos1 = cos(2 * pi * day_of_year / 365.25),
       sin1 = sin(2 * pi * day_of_year / 365.25),
       cos2 = cos(4 * pi * day_of_year / 365.25),
       sin2 = sin(4 * pi * day_of_year / 365.25)
     )
   
-  investigation_data <- depth_data %>%
-    filter(year == investigation_year)
+  investigation_data <- depth_data %>% filter(year == investigation_year)
   
-  if (nrow(baseline_data) < 20) {
-    stop("Insufficient baseline data (< 20 points). Need more historical data.")
-  }
-  
-  # Create prediction grid for smooth curves
+  # Prediction grid
   prediction_grid <- tibble(
     day_of_year = 1:365,
     cos1 = cos(2 * pi * day_of_year / 365.25),
@@ -47,375 +43,252 @@ create_improved_chlorophyll_qc_plot <- function(data, selected_depth, selected_f
     sin2 = sin(4 * pi * day_of_year / 365.25)
   )
   
-  # Initialize method_name before conditional blocks
-  method_name <- "Unknown Method"
-  
-  # Method 1: Seasonal GAM approach
+  # Calculate seasonal patterns and bounds
   if (variability_method == "gam_quantiles") {
-    
-    # Fit seasonal GAM for median
-    tryCatch({
-      gam_model <- gam(log_chla ~ s(day_of_year, bs = "cc", k = 20), 
-                       data = baseline_data)
-      
-      # Predict median values
-      prediction_grid$pred_log_median <- predict(gam_model, newdata = prediction_grid)
-      prediction_grid$pred_median <- exp(prediction_grid$pred_log_median) - 0.01
-      
-      # Calculate residuals for variability estimation
-      baseline_data$residuals <- residuals(gam_model)
-      baseline_data$fitted_log <- fitted(gam_model)
-      
-      # Moving window quantiles for variability
-      calculate_moving_quantiles <- function(target_day, window_days = window_days) {
-        # Handle year wrap-around
-        if (target_day <= window_days) {
-          day_range <- c((365 + target_day - window_days):365, 1:(target_day + window_days))
-        } else if (target_day > (365 - window_days)) {
-          day_range <- c((target_day - window_days):365, 1:(target_day + window_days - 365))
-        } else {
-          day_range <- (target_day - window_days):(target_day + window_days)
-        }
-        
-        window_data <- baseline_data %>%
-          filter(day_of_year %in% day_range)
-        
-        if (nrow(window_data) < 5) {
-          return(list(q10 = NA, q90 = NA, q05 = NA, q95 = NA))
-        }
-        
-        # Calculate quantiles of residuals
-        residual_quantiles <- quantile(window_data$residuals, 
-                                       probs = c(0.05, 0.10, 0.90, 0.95), 
-                                       na.rm = TRUE)
-        
-        return(list(
-          q05 = residual_quantiles[1],
-          q10 = residual_quantiles[2], 
-          q90 = residual_quantiles[3],
-          q95 = residual_quantiles[4]
-        ))
-      }
-      
-      # Apply moving window to each day
-      quantile_results <- map_dfr(1:365, ~{
-        quants <- calculate_moving_quantiles(.x, window_days)
-        tibble(
-          day_of_year = .x,
-          residual_q05 = quants$q05,
-          residual_q10 = quants$q10,
-          residual_q90 = quants$q90,
-          residual_q95 = quants$q95
-        )
-      })
-      
-      # Combine with predictions
-      prediction_grid <- prediction_grid %>%
-        left_join(quantile_results, by = "day_of_year") %>%
-        mutate(
-          # Convert back to original scale
-          lower_bound_90 = exp(pred_log_median + residual_q10) - 0.01,
-          upper_bound_90 = exp(pred_log_median + residual_q90) - 0.01,
-          lower_bound_95 = exp(pred_log_median + residual_q05) - 0.01,
-          upper_bound_95 = exp(pred_log_median + residual_q95) - 0.01,
-          
-          # Ensure non-negative bounds
-          lower_bound_90 = pmax(0, lower_bound_90),
-          upper_bound_90 = pmax(0, upper_bound_90),
-          lower_bound_95 = pmax(0, lower_bound_95),
-          upper_bound_95 = pmax(0, upper_bound_95)
-        )
-      
-      method_name <- paste0("GAM + Moving Window (±", window_days, " days)")
-      
-    }, error = function(e) {
-      cat("GAM fitting failed:", e$message, "\nFalling back to harmonic regression\n")
-      # Fallback to harmonic regression
-      harm_model <- lm(log_chla ~ cos1 + sin1 + cos2 + sin2, data = baseline_data)
-      prediction_grid$pred_log_median <- predict(harm_model, newdata = prediction_grid)
-      prediction_grid$pred_median <- exp(prediction_grid$pred_log_median) - 0.01
-      
-      # Simple quantiles for fallback
-      overall_q10 <- quantile(baseline_data$log_chla, 0.10, na.rm = TRUE)
-      overall_q90 <- quantile(baseline_data$log_chla, 0.90, na.rm = TRUE)
-      
-      prediction_grid <- prediction_grid %>%
-        mutate(
-          lower_bound_90 = exp(pred_log_median + (overall_q10 - mean(baseline_data$log_chla, na.rm = TRUE))) - 0.01,
-          upper_bound_90 = exp(pred_log_median + (overall_q90 - mean(baseline_data$log_chla, na.rm = TRUE))) - 0.01,
-          lower_bound_95 = lower_bound_90 * 0.8,
-          upper_bound_95 = upper_bound_90 * 1.2,
-          lower_bound_90 = pmax(0, lower_bound_90),
-          upper_bound_90 = pmax(0, upper_bound_90),
-          lower_bound_95 = pmax(0, lower_bound_95),
-          upper_bound_95 = pmax(0, upper_bound_95)
-        )
-      
-      method_name <- "Harmonic Regression (GAM fallback)"
-    })
-    
+    prediction_grid <- fit_gam_model(baseline_data, prediction_grid, window_days)
+    method_name <- paste0("GAM + Moving Window (±", window_days, " days)")
   } else {
-    # Fallback to original weekly method for comparison
-    weekly_stats <- baseline_data %>%
-      mutate(week = week(date)) %>%
-      group_by(week) %>%
-      summarise(
-        median_chla = median(chla, na.rm = TRUE),
-        q10 = quantile(chla, 0.10, na.rm = TRUE),
-        q90 = quantile(chla, 0.90, na.rm = TRUE),
-        q05 = quantile(chla, 0.05, na.rm = TRUE),
-        q95 = quantile(chla, 0.95, na.rm = TRUE),
-        .groups = 'drop'
-      )
-    
-    # Convert to day of year for plotting
-    prediction_grid <- prediction_grid %>%
-      mutate(
-        week = week(as.Date(paste("2020", day_of_year), format = "%Y %j"))
-      ) %>%
-      left_join(weekly_stats, by = "week") %>%
-      mutate(
-        pred_median = median_chla,
-        lower_bound_90 = q10,
-        upper_bound_90 = q90,
-        lower_bound_95 = q05,
-        upper_bound_95 = q95
-      )
-    
-    method_name <- "Weekly Averages (Original)"
+    prediction_grid <- fit_weekly_model(baseline_data, prediction_grid)
+    method_name <- "Weekly Averages"
   }
   
-  # Create the plot
-  p <- plot_ly()
+  # Create plot
+  create_qc_plotly(prediction_grid, investigation_data, investigation_year, 
+                   selected_depth, selected_filter_type, method_name)
+}
+
+# GAM fitting helper function
+fit_gam_model <- function(baseline_data, prediction_grid, window_days) {
   
-  # Add 95% confidence ribbon (lighter)
-  p <- p %>%
-    add_ribbons(
-      data = prediction_grid,
-      x = ~day_of_year,
-      ymin = ~lower_bound_95,
-      ymax = ~upper_bound_95,
-      fillcolor = "rgba(59, 130, 246, 0.1)",
-      line = list(color = "transparent"),
-      name = "95% Range",
-      hoverinfo = "text",
-      text = ~paste("Day:", day_of_year, "<br>95% Range:", 
-                    round(lower_bound_95, 3), "-", round(upper_bound_95, 3), "mg/m³")
+  # Fit GAM with fallback to harmonic regression
+  tryCatch({
+    gam_model <- gam(log_chla ~ s(day_of_year, bs = "cc", k = 20), data = baseline_data)
+    prediction_grid$pred_log_median <- predict(gam_model, newdata = prediction_grid)
+    baseline_data$residuals <- residuals(gam_model)
+    
+    # Calculate moving window quantiles
+    quantile_results <- map_dfr(1:365, ~calculate_moving_quantiles(.x, baseline_data, window_days))
+    
+    prediction_grid %>%
+      left_join(quantile_results, by = "day_of_year") %>%
+      mutate(
+        pred_median = exp(pred_log_median) - 0.01,
+        lower_bound_90 = pmax(0, exp(pred_log_median + residual_q10) - 0.01),
+        upper_bound_90 = pmax(0, exp(pred_log_median + residual_q90) - 0.01),
+        lower_bound_95 = pmax(0, exp(pred_log_median + residual_q05) - 0.01),
+        upper_bound_95 = pmax(0, exp(pred_log_median + residual_q95) - 0.01)
+      )
+    
+  }, error = function(e) {
+    # Fallback to harmonic regression
+    harm_model <- lm(log_chla ~ cos1 + sin1 + cos2 + sin2, data = baseline_data)
+    pred_log <- predict(harm_model, newdata = prediction_grid)
+    
+    # Simple quantile adjustment
+    q_adjust <- quantile(baseline_data$log_chla, c(0.05, 0.10, 0.90, 0.95), na.rm = TRUE) - 
+      mean(baseline_data$log_chla, na.rm = TRUE)
+    
+    prediction_grid %>%
+      mutate(
+        pred_median = exp(pred_log) - 0.01,
+        lower_bound_90 = pmax(0, exp(pred_log + q_adjust[2]) - 0.01),
+        upper_bound_90 = pmax(0, exp(pred_log + q_adjust[3]) - 0.01),
+        lower_bound_95 = pmax(0, exp(pred_log + q_adjust[1]) - 0.01),
+        upper_bound_95 = pmax(0, exp(pred_log + q_adjust[4]) - 0.01)
+      )
+  })
+}
+
+# Weekly model helper function
+fit_weekly_model <- function(baseline_data, prediction_grid) {
+  weekly_stats <- baseline_data %>%
+    mutate(week = week(as.Date(paste("2020", day_of_year), format = "%Y %j"))) %>%
+    group_by(week) %>%
+    summarise(
+      pred_median = median(exp(log_chla) - 0.01, na.rm = TRUE),
+      lower_bound_90 = quantile(exp(log_chla) - 0.01, 0.10, na.rm = TRUE),
+      upper_bound_90 = quantile(exp(log_chla) - 0.01, 0.90, na.rm = TRUE),
+      lower_bound_95 = quantile(exp(log_chla) - 0.01, 0.05, na.rm = TRUE),
+      upper_bound_95 = quantile(exp(log_chla) - 0.01, 0.95, na.rm = TRUE),
+      .groups = 'drop'
     )
   
-  # Add 90% confidence ribbon (darker)
-  p <- p %>%
-    add_ribbons(
-      data = prediction_grid,
-      x = ~day_of_year,
-      ymin = ~lower_bound_90,
-      ymax = ~upper_bound_90,
-      fillcolor = "rgba(59, 130, 246, 0.2)",
-      line = list(color = "transparent"),
-      name = "90% Range",
-      hoverinfo = "text",
-      text = ~paste("Day:", day_of_year, "<br>90% Range:", 
-                    round(lower_bound_90, 3), "-", round(upper_bound_90, 3), "mg/m³",
-                    "<br>Median:", round(pred_median, 3), "mg/m³")
-    )
+  prediction_grid %>%
+    mutate(week = week(as.Date(paste("2020", day_of_year), format = "%Y %j"))) %>%
+    left_join(weekly_stats, by = "week")
+}
+
+# Moving window quantile calculation
+calculate_moving_quantiles <- function(target_day, baseline_data, window_days) {
+  # Handle year wrap-around
+  day_range <- if (target_day <= window_days) {
+    c((365 + target_day - window_days):365, 1:(target_day + window_days))
+  } else if (target_day > (365 - window_days)) {
+    c((target_day - window_days):365, 1:(target_day + window_days - 365))
+  } else {
+    (target_day - window_days):(target_day + window_days)
+  }
   
-  # Add median line
-  p <- p %>%
+  window_data <- baseline_data %>% filter(day_of_year %in% day_range)
+  
+  if (nrow(window_data) < 5) {
+    return(tibble(day_of_year = target_day, 
+                  residual_q05 = NA, residual_q10 = NA, 
+                  residual_q90 = NA, residual_q95 = NA))
+  }
+  
+  quantiles <- quantile(window_data$residuals, c(0.05, 0.10, 0.90, 0.95), na.rm = TRUE)
+  tibble(
+    day_of_year = target_day,
+    residual_q05 = quantiles[1],
+    residual_q10 = quantiles[2],
+    residual_q90 = quantiles[3],
+    residual_q95 = quantiles[4]
+  )
+}
+
+# Plotly creation helper
+create_qc_plotly <- function(prediction_grid, investigation_data, investigation_year, 
+                             selected_depth, selected_filter_type, method_name) {
+  
+  p <- plot_ly() %>%
+    # 95% confidence ribbon
+    add_ribbons(
+      data = prediction_grid, x = ~day_of_year,
+      ymin = ~lower_bound_95, ymax = ~upper_bound_95,
+      fillcolor = "rgba(59, 130, 246, 0.1)", line = list(color = "transparent"),
+      name = "95% Range", hovertemplate = "Day: %{x}<br>95% Range: %{ymin:.3f}-%{ymax:.3f} mg/m³"
+    ) %>%
+    # 90% confidence ribbon
+    add_ribbons(
+      data = prediction_grid, x = ~day_of_year,
+      ymin = ~lower_bound_90, ymax = ~upper_bound_90,
+      fillcolor = "rgba(59, 130, 246, 0.2)", line = list(color = "transparent"),
+      name = "90% Range", hovertemplate = "Day: %{x}<br>90% Range: %{ymin:.3f}-%{ymax:.3f} mg/m³"
+    ) %>%
+    # Median line
     add_lines(
-      data = prediction_grid,
-      x = ~day_of_year,
-      y = ~pred_median,
+      data = prediction_grid, x = ~day_of_year, y = ~pred_median,
       line = list(color = "rgb(59, 130, 246)", width = 3),
-      name = "Seasonal Median",
-      hoverinfo = "text",
-      text = ~paste("Day:", day_of_year, "<br>Predicted Median:", round(pred_median, 3), "mg/m³")
+      name = "Seasonal Median", hovertemplate = "Day: %{x}<br>Median: %{y:.3f} mg/m³"
     )
   
-  # Add investigation year points
+  # Add investigation year data
   if (nrow(investigation_data) > 0) {
-    # Normal points (not flagged)
+    # Normal points
     normal_points <- investigation_data %>% filter(!chla_flag | is.na(chla_flag))
     if (nrow(normal_points) > 0) {
-      p <- p %>%
-        add_markers(
-          data = normal_points,
-          x = ~day_of_year,
-          y = ~chla,
-          marker = list(color = "rgb(34, 197, 94)", size = 8),
-          name = paste(investigation_year, "- Normal"),
-          hoverinfo = "text",
-          text = ~paste("Date:", date, "<br>Hakai ID:", hakai_id,
-                        "<br>Chlorophyll:", round(chla, 3), "mg/m³",
-                        "<br>Depth:", line_out_depth, "m")
-        )
+      p <- p %>% add_markers(
+        data = normal_points, x = ~day_of_year, y = ~chla,
+        marker = list(color = "rgb(34, 197, 94)", size = 8),
+        name = paste(investigation_year, "- Normal"),
+        hovertemplate = "Date: %{customdata}<br>Chlorophyll: %{y:.3f} mg/m³<br>Depth: %{text} m",
+        customdata = ~date, text = ~line_out_depth
+      )
     }
     
     # Flagged points
     flagged_points <- investigation_data %>% filter(chla_flag == TRUE)
     if (nrow(flagged_points) > 0) {
-      p <- p %>%
-        add_markers(
-          data = flagged_points,
-          x = ~day_of_year,
-          y = ~chla,
-          marker = list(color = "rgb(239, 68, 68)", size = 8),
-          name = paste(investigation_year, "- Flagged"),
-          hoverinfo = "text",
-          text = ~paste("Date:", date, "<br>Hakai ID:", hakai_id,
-                        "<br>Chlorophyll:", round(chla, 3), "mg/m³",
-                        "<br>Depth:", line_out_depth, "m",
-                        "<br>⚠ FLAGGED")
-        )
+      p <- p %>% add_markers(
+        data = flagged_points, x = ~day_of_year, y = ~chla,
+        marker = list(color = "rgb(239, 68, 68)", size = 8),
+        name = paste(investigation_year, "- Flagged"),
+        hovertemplate = "Date: %{customdata}<br>Chlorophyll: %{y:.3f} mg/m³<br>Depth: %{text} m<br>⚠ FLAGGED",
+        customdata = ~date, text = ~line_out_depth
+      )
     }
   }
   
   # Layout
-  p <- p %>%
-    layout(
-      title = list(
-        text = paste("Improved Chlorophyll QC - Depth:", selected_depth, "m -", selected_filter_type, "Filter<br>", 
-                     "<sub>Method:", method_name, "</sub>"),
-        font = list(size = 16, family = "Arial, sans-serif")
-      ),
-      xaxis = list(
-        title = "Day of Year",
-        showgrid = TRUE,
-        gridcolor = "rgba(0,0,0,0.1)",
-        range = c(1, 365)
-      ),
-      yaxis = list(
-        title = "Chlorophyll (mg/m³)",
-        showgrid = TRUE,
-        gridcolor = "rgba(0,0,0,0.1)"
-      ),
-      hovermode = "closest",
-      legend = list(
-        x = 0.01,
-        y = 0.99,
-        bgcolor = "rgba(255,255,255,0.8)",
-        bordercolor = "rgba(0,0,0,0.2)",
-        borderwidth = 1
-      ),
-      plot_bgcolor = "white",
-      paper_bgcolor = "white"
-    )
-  
-  return(p)
+  p %>% layout(
+    title = paste("Chlorophyll QC - Depth:", selected_depth, "m -", selected_filter_type, 
+                  "Filter<br><sub>Method:", method_name, "</sub>"),
+    xaxis = list(title = "Day of Year", showgrid = TRUE, range = c(1, 365)),
+    yaxis = list(title = "Chlorophyll (mg/m³)", showgrid = TRUE),
+    hovermode = "closest",
+    legend = list(x = 0.01, y = 0.99, bgcolor = "rgba(255,255,255,0.8)"),
+    plot_bgcolor = "white"
+  )
 }
 
-# Updated summary function
-generate_improved_summary_stats <- function(data, selected_depth, selected_filter_type, investigation_year) {
-  
+# Streamlined summary function
+generate_summary_stats <- function(data, selected_depth, selected_filter_type, investigation_year) {
   investigation_data <- data %>%
     filter(line_out_depth == selected_depth,
            filter_type == selected_filter_type,
            year(as.Date(date)) == investigation_year,
-           !is.na(chla)) %>%
-    mutate(chla = as.numeric(chla),
-           chla_flag = as.logical(chla_flag))
+           !is.na(chla),
+           chla_flag != "SVD" | is.na(chla_flag)) %>%
+    mutate(chla = as.numeric(chla), chla_flag = as.logical(chla_flag))
   
   baseline_data <- data %>%
     filter(line_out_depth == selected_depth,
            filter_type == selected_filter_type,
            year(as.Date(date)) != investigation_year,
-           !is.na(chla)) %>%
-    mutate(chla = as.numeric(chla))
+           !is.na(chla),
+           chla_flag != "SVD" | is.na(chla_flag))
   
   if (nrow(investigation_data) == 0) {
-    return(list(
-      total_samples = 0,
-      flagged_samples = 0,
-      mean_chla = NA,
-      date_range = "No data",
-      baseline_years = 0,
-      baseline_samples = 0
-    ))
+    return(list(total_samples = 0, flagged_samples = 0, mean_chla = NA, 
+                date_range = "No data", baseline_years = 0, baseline_samples = 0))
   }
   
-  stats <- list(
+  list(
     total_samples = nrow(investigation_data),
     flagged_samples = sum(investigation_data$chla_flag, na.rm = TRUE),
     mean_chla = mean(investigation_data$chla, na.rm = TRUE),
     median_chla = median(investigation_data$chla, na.rm = TRUE),
-    date_range = paste(min(investigation_data$date), "-", max(investigation_data$date)),
+    date_range = paste(range(investigation_data$date), collapse = " - "),
     baseline_years = length(unique(year(as.Date(baseline_data$date)))),
     baseline_samples = nrow(baseline_data)
   )
-  
-  return(stats)
 }
 
-# Updated main function
-run_improved_chlorophyll_qc <- function(data, selected_depth = NULL, selected_filter_type = NULL, 
-                                        investigation_year = NULL, variability_method = "gam_quantiles",
-                                        window_days = 14) {
+# Main function with cleaner output
+timeseries_qc <- function(data, selected_depth = NULL, selected_filter_type = NULL, 
+                          investigation_year = NULL, variability_method = "gam_quantiles",
+                          window_days = 14) {
   
-  # Get available options
+  # Get defaults if not provided
   options <- get_available_options(data)
+  selected_depth <- selected_depth %||% options$depths[1]
+  selected_filter_type <- selected_filter_type %||% options$filter_types[1]
+  investigation_year <- investigation_year %||% options$years[1]
   
-  # Use defaults if not provided
-  if (is.null(selected_depth)) {
-    selected_depth <- options$depths[1]
-  }
-  if (is.null(selected_filter_type)) {
-    selected_filter_type <- options$filter_types[1]
-  }
-  if (is.null(investigation_year)) {
-    investigation_year <- options$years[1]
-  }
+  # Create plot and stats
+  plot <- create_chlorophyll_qc_plot(data, selected_depth, selected_filter_type, 
+                                     investigation_year, variability_method, window_days)
+  stats <- generate_summary_stats(data, selected_depth, selected_filter_type, investigation_year)
   
-  # Create the plot
-  plot <- create_improved_chlorophyll_qc_plot(data, selected_depth, selected_filter_type, 
-                                              investigation_year, variability_method, window_days)
+  # Print concise summary
+  cat("Time Series QC Summary:\n",
+      "Depth: ", selected_depth, "m | Filter: ", selected_filter_type, 
+      " | Year: ", investigation_year, "\n",
+      "Samples: ", stats$total_samples, " (", stats$flagged_samples, " flagged) | ",
+      "Mean: ", round(stats$mean_chla, 3), " mg/m³\n",
+      "Baseline: ", stats$baseline_samples, " samples from ", stats$baseline_years, " years\n",
+      sep = "")
   
-  # Generate summary statistics
-  stats <- generate_improved_summary_stats(data, selected_depth, selected_filter_type, investigation_year)
-  
-  # Print summary
-  cat("=== Improved Chlorophyll QC Summary ===\n")
-  cat("Depth:", selected_depth, "m\n")
-  cat("Filter Type:", selected_filter_type, "\n")
-  cat("Investigation Year:", investigation_year, "\n")
-  cat("Method:", variability_method, "\n")
-  if (variability_method == "gam_quantiles") {
-    cat("Window Size: ±", window_days, "days\n")
-  }
-  cat("Total Samples:", stats$total_samples, "\n")
-  cat("Flagged Samples:", stats$flagged_samples, "\n")
-  cat("Mean Chlorophyll:", round(stats$mean_chla, 3), "mg/m³\n")
-  cat("Median Chlorophyll:", round(stats$median_chla, 3), "mg/m³\n")
-  cat("Date Range:", stats$date_range, "\n")
-  cat("Baseline Data:", stats$baseline_samples, "samples from", stats$baseline_years, "years\n")
-  cat("=====================================\n\n")
-  
-  # Display the plot
   print(plot)
-  
-  return(list(plot = plot, stats = stats, options = options))
+  list(plot = plot, stats = stats, options = options)
 }
 
-# Function to get available options (reused from original)
+# Helper function for available options
 get_available_options <- function(data) {
-  depths <- data %>%
-    filter(!is.na(line_out_depth)) %>%
-    distinct(line_out_depth) %>%
-    arrange(as.numeric(line_out_depth)) %>%
-    pull(line_out_depth)
-  
-  years <- data %>%
-    filter(!is.na(date)) %>%
-    mutate(year = year(as.Date(date))) %>%
-    distinct(year) %>%
-    arrange(desc(year)) %>%
-    pull(year)
-  
-  filter_types <- data %>%
-    filter(!is.na(filter_type)) %>%
-    distinct(filter_type) %>%
-    pull(filter_type)
-  
-  return(list(depths = depths, years = years, filter_types = filter_types))
+  list(
+    depths = data %>% filter(!is.na(line_out_depth)) %>% 
+      distinct(line_out_depth) %>% arrange(as.numeric(line_out_depth)) %>% pull(),
+    years = data %>% filter(!is.na(date)) %>% 
+      mutate(year = year(as.Date(date))) %>% distinct(year) %>% 
+      arrange(desc(year)) %>% pull(),
+    filter_types = data %>% filter(!is.na(filter_type)) %>% 
+      distinct(filter_type) %>% pull()
+  )
 }
+
+# Null coalescing operator helper
+`%||%` <- function(x, y) if (is.null(x)) y else x
 
 # ----------------------------------------------------------------------------
 
@@ -896,57 +769,175 @@ calculate_qc_metrics <- function(comparison_data) {
 # -----------------------------------------------------------------------------
 
 
-# Function to perform basic chlorophyll QC checks
-perform_basic_chlorophyll_qc_checks <- function(data) {
+# Streamlined function to perform comprehensive chlorophyll QC checks
+perform_comprehensive_chlorophyll_qc <- function(data) {
   
-  # Convert date to Date class if it isn't already
+  # Helper function to save issues and print results
+  save_and_print_issues <- function(issue_data, check_name, description) {
+    if (nrow(issue_data) > 0) {
+      cat("Found", nrow(issue_data), description, ":\n")
+      print(issue_data)
+      
+      # Create issues directory if needed
+      if (!dir.exists(here("issues"))) {
+        dir.create(here("issues"), recursive = TRUE)
+      }
+      
+      # Save to CSV
+      csv_filename <- here("issues", paste0(check_name, "_", Sys.Date(), ".csv"))
+      write.csv(issue_data, csv_filename, row.names = FALSE)
+      cat("Issues saved to:", csv_filename, "\n")
+    } else {
+      cat("No", description, "found.\n")
+    }
+    cat("\n")
+    return(issue_data)
+  }
+  
+  # Convert date to Date class if needed
   data <- data %>%
     mutate(date = as.Date(date))
   
-  # Check 1: Records with negative chlorophyll and/or phaeopigments
+  # Initialize results list
+  results <- list(summary_stats = list(total_records = nrow(data)))
+  
+  # Check 1: Negative values
   cat("=== CHECK 1: NEGATIVE VALUES ===\n")
-  negative_values <- data %>%
+  results$negative_values <- data %>%
     filter(chla < 0 | phaeo < 0 | (!is.na(chla) & !is.na(phaeo) & (chla < 0 | phaeo < 0))) %>%
     select(hakai_id, site_id, line_out_depth, date, chla, phaeo, 
            any_of(c("chla_flag", "phaeo_flag"))) %>%
-    mutate(
-      chla = round(chla, 2),
-      phaeo = round(phaeo, 2)
-    ) %>%
-    arrange(date, site_id, line_out_depth)
+    mutate(chla = round(chla, 2), phaeo = round(phaeo, 2)) %>%
+    arrange(date, site_id, line_out_depth) %>%
+    save_and_print_issues("negative_values", "records with negative chlorophyll and/or phaeopigments")
   
-  if (nrow(negative_values) > 0) {
-    cat("Found", nrow(negative_values), "records with negative chlorophyll and/or phaeopigments:\n")
-    print(negative_values)
-    
-    # Create issues directory if it doesn't exist
-    if (!dir.exists(here("issues"))) {
-      dir.create(here("issues"), recursive = TRUE)
-    }
-    
-    # Save to CSV
-    csv_filename <- here("issues", paste0("negative_values_", Sys.Date(), ".csv"))
-    write.csv(negative_values, csv_filename, row.names = FALSE)
-    cat("Negative values saved to:", csv_filename, "\n")
+  # Check 2: Low acid ratios
+  cat("=== CHECK 2: LOW ACID RATIOS ===\n")
+  # Calculate acid ratio if needed
+  if (!"acid_ratio" %in% names(data) && all(c("before_acid", "after_acid") %in% names(data))) {
+    data <- data %>% mutate(acid_ratio = before_acid / after_acid)
+    cat("Calculated acid_ratio from before_acid/after_acid\n")
+  }
+  
+  if ("acid_ratio" %in% names(data)) {
+    results$low_acid_ratios <- data %>%
+      filter(!is.na(acid_ratio) & acid_ratio < 1.01) %>%
+      select(hakai_id, site_id, line_out_depth, date, acid_ratio, 
+             any_of(c("before_acid", "after_acid", "chla", "phaeo", "chla_flag", "phaeo_flag"))) %>%
+      mutate(chla = round(chla, 2), phaeo = round(phaeo, 2)) %>%
+      arrange(date, site_id, line_out_depth) %>%
+      save_and_print_issues("low_acid_ratios", "records with acid ratios < 1.01")
   } else {
-    cat("No records with negative chlorophyll or phaeopigments found.\n")
+    cat("Cannot check acid ratios. Need 'acid_ratio' column or 'before_acid'/'after_acid' columns.\n\n")
+    results$low_acid_ratios <- data.frame()
+  }
+  
+  # Check 3: Non-standard volumes
+  cat("=== CHECK 3: NON-STANDARD VOLUMES ===\n")
+  volume_issues <- data.frame()
+  
+  if ("acetone_volume_ml" %in% names(data)) {
+    acetone_issues <- data %>%
+      filter(!is.na(acetone_volume_ml) & acetone_volume_ml != 10) %>%
+      select(hakai_id, site_id, line_out_depth, date, acetone_volume_ml, 
+             any_of(c("chla", "phaeo", "volume"))) %>%
+      mutate(issue_type = "Non-standard acetone volume",
+             chla = round(chla, 2), phaeo = round(phaeo, 2)) %>%
+      arrange(date, site_id, line_out_depth)
+    
+    volume_issues <- bind_rows(volume_issues, acetone_issues)
+  }
+  
+  if ("volume" %in% names(data)) {
+    sample_volume_issues <- data %>%
+      filter(!is.na(volume) & volume != 250) %>%
+      select(hakai_id, site_id, line_out_depth, date, volume, 
+             any_of(c("chla", "phaeo", "acetone_volume_ml"))) %>%
+      mutate(issue_type = "Non-standard sample volume",
+             chla = round(chla, 2), phaeo = round(phaeo, 2)) %>%
+      arrange(date, site_id, line_out_depth)
+    
+    volume_issues <- bind_rows(volume_issues, sample_volume_issues)
+  }
+  
+  if (nrow(volume_issues) == 0 && !any(c("acetone_volume_ml", "volume") %in% names(data))) {
+    cat("Cannot check volumes. Missing 'acetone_volume_ml' and 'volume' columns.\n\n")
+  }
+  
+  results$volume_issues <- save_and_print_issues(volume_issues, "volume_issues", "records with non-standard volumes")
+  
+  # Check 4: Quality log issues
+  cat("=== CHECK 4: QUALITY LOG ISSUES ===\n")
+  if ("quality_log" %in% names(data)) {
+    # Calculate quality log statistics
+    quality_stats <- data %>%
+      filter(!is.na(quality_log) & quality_log != "") %>%
+      mutate(log_length = nchar(quality_log)) %>%
+      summarise(
+        mean_length = mean(log_length, na.rm = TRUE),
+        median_length = median(log_length, na.rm = TRUE),
+        q75_length = quantile(log_length, 0.75, na.rm = TRUE),
+        max_length = max(log_length, na.rm = TRUE),
+        n_with_logs = n()
+      )
+    
+    if (quality_stats$n_with_logs > 0) {
+      # Use 75th percentile as threshold for "long" quality logs
+      threshold <- quality_stats$q75_length
+      cat("Quality log statistics:\n")
+      cat("  Records with quality logs:", quality_stats$n_with_logs, "\n")
+      cat("  Mean length:", round(quality_stats$mean_length, 1), "characters\n")
+      cat("  Median length:", quality_stats$median_length, "characters\n")
+      cat("  75th percentile:", quality_stats$q75_length, "characters\n")
+      cat("  Using", quality_stats$q75_length, "characters as threshold for flagging\n\n")
+      
+      # Identify records with unusually long quality logs
+      results$quality_log_issues <- data %>%
+        filter(!is.na(quality_log) & quality_log != "" & nchar(quality_log) > threshold) %>%
+        mutate(log_length = nchar(quality_log)) %>%
+        select(hakai_id, site_id, line_out_depth, date, log_length, quality_log,
+               any_of(c("chla", "phaeo", "chla_flag"))) %>%
+        mutate(chla = round(chla, 2), phaeo = round(phaeo, 2)) %>%
+        arrange(date, site_id, line_out_depth) %>%
+        save_and_print_issues("quality_log_issues", "records with unusually long quality logs")
+      
+      # Create readable quality log summary
+      results$quality_log_summary <- data %>%
+        filter(!is.na(quality_log) & quality_log != "") %>%
+        mutate(log_length = nchar(quality_log)) %>%
+        select(hakai_id, site_id, line_out_depth, date, log_length, quality_log) %>%
+        arrange(desc(log_length), date) %>%
+        mutate(quality_log = ifelse(nchar(quality_log) > 80, 
+                                    paste0(substr(quality_log, 1, 77), "..."), 
+                                    quality_log))  # Truncate long text for readability
+      
+      # Save readable quality log summary
+      if (nrow(results$quality_log_summary) > 0) {
+        csv_filename <- here("issues", paste0("quality_log_summary_", Sys.Date(), ".csv"))
+        write.csv(results$quality_log_summary, csv_filename, row.names = FALSE)
+        cat("All quality logs saved to:", csv_filename, "\n")
+      }
+      
+      results$quality_log_stats <- quality_stats
+    } else {
+      cat("No quality log entries found.\n")
+      results$quality_log_issues <- data.frame()
+      results$quality_log_summary <- data.frame()
+    }
+  } else {
+    cat("Cannot check quality logs. Missing 'quality_log' column.\n")
+    results$quality_log_issues <- data.frame()
+    results$quality_log_summary <- data.frame()
   }
   cat("\n")
   
-  # Check 4: Missing size fractions for each collection time
-  cat("=== CHECK 4: MISSING SIZE FRACTIONS ===\n")
-  
-  if ("collected" %in% names(data) && "size_fraction" %in% names(data)) {
-    # Define expected size fractions (excluding Bulk GF/F)
+  # Check 5: Missing size fractions
+  cat("=== CHECK 5: MISSING SIZE FRACTIONS ===\n")
+  if (all(c("collected", "size_fraction") %in% names(data))) {
     expected_fractions <- c("GF/F", "3um", "20um")
     
-    # Check for missing size fractions by collection time
-    missing_fractions <- data %>%
-      filter(!is.na(collected), !is.na(size_fraction)) %>%
-      select(collected, site_id, line_out_depth, size_fraction, 
-             any_of(c("hakai_id", "date"))) %>%
-      # Group by collection parameters (excluding Bulk GF/F)
-      filter(!grepl("Bulk", size_fraction, ignore.case = TRUE)) %>%
+    results$missing_fractions <- data %>%
+      filter(!is.na(collected), !is.na(size_fraction), !grepl("Bulk", size_fraction, ignore.case = TRUE)) %>%
       group_by(collected, site_id, line_out_depth) %>%
       summarise(
         available_fractions = paste(sort(unique(size_fraction)), collapse = ", "),
@@ -957,299 +948,142 @@ perform_basic_chlorophyll_qc_checks <- function(data) {
         .groups = 'drop'
       ) %>%
       filter(n_fractions < 3 | missing_fractions != "") %>%
-      arrange(collected, site_id, line_out_depth)
-    
-    if (nrow(missing_fractions) > 0) {
-      cat("Found", nrow(missing_fractions), "collection times missing size fractions:\n")
-      print(missing_fractions)
-      
-      # Create issues directory if it doesn't exist
-      if (!dir.exists(here("issues"))) {
-        dir.create(here("issues"), recursive = TRUE)
-      }
-      
-      # Save to CSV
-      csv_filename <- here("issues", paste0("missing_size_fractions_", Sys.Date(), ".csv"))
-      write.csv(missing_fractions, csv_filename, row.names = FALSE)
-      cat("Missing size fractions saved to:", csv_filename, "\n")
-    } else {
-      cat("All collection times have complete size fraction sets (GF/F, 3um, 20um).\n")
-    }
+      arrange(collected, site_id, line_out_depth) %>%
+      save_and_print_issues("missing_size_fractions", "collection times missing size fractions")
   } else {
     missing_cols <- setdiff(c("collected", "size_fraction"), names(data))
-    cat("WARNING: Cannot check size fractions. Missing columns:", paste(missing_cols, collapse = ", "), "\n")
-    missing_fractions <- data.frame()
+    cat("Cannot check size fractions. Missing columns:", paste(missing_cols, collapse = ", "), "\n\n")
+    results$missing_fractions <- data.frame()
   }
-  cat("\n")
   
-  # Check 5: Replicated hakai_id
-  cat("=== CHECK 5: REPLICATED HAKAI_ID ===\n")
-  
+  # Check 6: Replicated hakai_id
+  cat("=== CHECK 6: REPLICATED HAKAI_ID ===\n")
   if ("hakai_id" %in% names(data)) {
-    replicated_ids <- data %>%
+    results$replicated_ids <- data %>%
       count(hakai_id, name = "n_records") %>%
       filter(n_records > 1) %>%
       left_join(
         data %>%
           select(hakai_id, site_id, line_out_depth, date, 
                  any_of(c("collected", "size_fraction", "chla", "phaeo"))) %>%
-          mutate(
-            chla = round(chla, 2),
-            phaeo = round(phaeo, 2)
-          ),
+          mutate(chla = round(chla, 2), phaeo = round(phaeo, 2)),
         by = "hakai_id"
       ) %>%
-      arrange(hakai_id, date, site_id, line_out_depth)
-    
-    if (nrow(replicated_ids) > 0) {
-      cat("Found", length(unique(replicated_ids$hakai_id)), "replicated hakai_id values in", nrow(replicated_ids), "total records:\n")
-      print(replicated_ids)
+      arrange(hakai_id, date, site_id, line_out_depth) %>%
+      save_and_print_issues("replicated_hakai_ids", "replicated hakai_id values")
+  } else {
+    cat("Cannot check for replicated hakai_id. Missing 'hakai_id' column.\n\n")
+    results$replicated_ids <- data.frame()
+  }
+  
+  # Check 7: Calibration consistency (streamlined)
+  cat("=== CHECK 7: CALIBRATION CONSISTENCY ===\n")
+  calibration_cols <- c("flurometer_serial_no", "calibration", "acid_ratio_correction_factor", 
+                        "acid_coefficient", "calibration_slope")
+  available_cal_cols <- calibration_cols[calibration_cols %in% names(data)]
+  
+  if (length(available_cal_cols) > 0 && "flurometer_serial_no" %in% available_cal_cols) {
+    if ("analyzed" %in% names(data)) {
+      results$calibration_summary <- data %>%
+        filter(!is.na(date), !is.na(analyzed), if_all(all_of(available_cal_cols), ~ !is.na(.))) %>%
+        select(date, analyzed, all_of(available_cal_cols)) %>%
+        arrange(analyzed) %>%
+        group_by(flurometer_serial_no) %>%
+        group_by(across(all_of(available_cal_cols)), .add = FALSE) %>%
+        summarise(
+          start_date = min(date, na.rm = TRUE),
+          end_date = max(date, na.rm = TRUE),
+          start_analyzed = min(as.Date(analyzed), na.rm = TRUE),
+          end_analyzed = max(as.Date(analyzed), na.rm = TRUE),
+          n_records = n(),
+          date_range = paste(min(date, na.rm = TRUE), "to", max(date, na.rm = TRUE)),
+          analyzed_range = paste(min(as.Date(analyzed), na.rm = TRUE), "to", max(as.Date(analyzed), na.rm = TRUE)),
+          .groups = 'drop'
+        ) %>%
+        arrange(flurometer_serial_no, start_analyzed)
       
-      # Create issues directory if it doesn't exist
-      if (!dir.exists(here("issues"))) {
-        dir.create(here("issues"), recursive = TRUE)
+      # Check for calibration date issues - analyzed date should be after calibration date
+      if ("calibration" %in% available_cal_cols) {
+        calibration_date_issues <- results$calibration_summary %>%
+          mutate(
+            calibration_date = as.Date(calibration, tryFormats = c("%Y-%m-%d", "%m/%d/%Y", "%d/%m/%Y")),
+            date_issue = !is.na(calibration_date) & start_analyzed < calibration_date
+          ) %>%
+          filter(date_issue == TRUE) %>%
+          select(flurometer_serial_no, calibration, calibration_date, start_analyzed, end_analyzed,
+                 start_date, end_date, n_records, everything())
+        
+        if (nrow(calibration_date_issues) > 0) {
+          cat("WARNING: Found", nrow(calibration_date_issues), "calibration periods where analyzed date is before calibration date:\n")
+          print(calibration_date_issues)
+          
+          # Create issues directory if needed
+          if (!dir.exists(here("issues"))) {
+            dir.create(here("issues"), recursive = TRUE)
+          }
+          
+          csv_filename <- here("issues", paste0("calibration_date_issues_", Sys.Date(), ".csv"))
+          write.csv(calibration_date_issues, csv_filename, row.names = FALSE)
+          cat("Calibration date issues saved to:", csv_filename, "\n")
+          
+          results$calibration_date_issues <- calibration_date_issues
+        } else {
+          cat("No calibration date issues found (analyzed dates are after calibration dates).\n")
+        }
       }
-      
-      # Save to CSV
-      csv_filename <- here("issues", paste0("replicated_hakai_ids_", Sys.Date(), ".csv"))
-      write.csv(replicated_ids, csv_filename, row.names = FALSE)
-      cat("Replicated hakai_id records saved to:", csv_filename, "\n")
     } else {
-      cat("No replicated hakai_id values found.\n")
+      # Fallback if no analyzed column
+      cat("WARNING: 'analyzed' column not found. Using 'date' column instead.\n")
+      results$calibration_summary <- data %>%
+        filter(!is.na(date), if_all(all_of(available_cal_cols), ~ !is.na(.))) %>%
+        select(date, all_of(available_cal_cols)) %>%
+        arrange(date) %>%
+        group_by(flurometer_serial_no) %>%
+        group_by(across(all_of(available_cal_cols)), .add = FALSE) %>%
+        summarise(
+          start_date = min(date, na.rm = TRUE),
+          end_date = max(date, na.rm = TRUE),
+          n_records = n(),
+          date_range = paste(min(date, na.rm = TRUE), "to", max(date, na.rm = TRUE)),
+          .groups = 'drop'
+        ) %>%
+        arrange(flurometer_serial_no, start_date)
+    }
+    
+    if (nrow(results$calibration_summary) > 0) {
+      cat("Found", nrow(results$calibration_summary), "distinct calibration combinations\n")
+      print(results$calibration_summary)
     }
   } else {
-    cat("WARNING: Cannot check for replicated hakai_id. Missing 'hakai_id' column.\n")
-    replicated_ids <- data.frame()
-  }
-  
-  # Check 2: Records with acid ratios < 1.01
-  cat("=== CHECK 2: LOW ACID RATIOS ===\n")
-  
-  # Calculate acid ratio if not already present
-  if (!"acid_ratio" %in% names(data)) {
-    if (all(c("before_acid", "after_acid") %in% names(data))) {
-      data <- data %>%
-        mutate(acid_ratio = before_acid / after_acid)
-      cat("Calculated acid_ratio from before_acid/after_acid\n")
-    } else {
-      cat("ERROR: Cannot find acid ratio data. Need either 'acid_ratio' column or 'before_acid' and 'after_acid' columns.\n")
-      cat("Available columns:", paste(names(data), collapse = ", "), "\n\n")
-      low_acid_ratios <- data.frame()
-    }
-  }
-  
-  if ("acid_ratio" %in% names(data) || all(c("before_acid", "after_acid") %in% names(data))) {
-    low_acid_ratios <- data %>%
-      filter(!is.na(acid_ratio) & acid_ratio < 1.01) %>%
-      select(hakai_id, site_id, line_out_depth, date, acid_ratio, 
-             any_of(c("before_acid", "after_acid", "chla", "phaeo", "chla_flag", "phaeo_flag"))) %>%
-      mutate(
-        chla = round(chla, 2),
-        phaeo = round(phaeo, 2)
-      ) %>%
-      arrange(date, site_id, line_out_depth)
-    
-    if (nrow(low_acid_ratios) > 0) {
-      cat("Found", nrow(low_acid_ratios), "records with acid ratios < 1.01:\n")
-      print(low_acid_ratios)
-      
-      # Create issues directory if it doesn't exist
-      if (!dir.exists(here("issues"))) {
-        dir.create(here("issues"), recursive = TRUE)
-      }
-      
-      # Save to CSV
-      csv_filename <- here("issues", paste0("low_acid_ratios_", Sys.Date(), ".csv"))
-      write.csv(low_acid_ratios, csv_filename, row.names = FALSE)
-      cat("Low acid ratios saved to:", csv_filename, "\n")
-    } else {
-      cat("No records with acid ratios < 1.01 found.\n")
-    }
+    cat("Cannot perform calibration analysis. Missing required columns.\n")
+    results$calibration_summary <- data.frame()
   }
   cat("\n")
   
-  # Check 3: Calibration consistency check
-  cat("=== CHECK 3: CALIBRATION CONSISTENCY ===\n")
+  # Update summary statistics
+  results$summary_stats <- c(results$summary_stats, list(
+    negative_records = nrow(results$negative_values),
+    low_acid_ratio_records = nrow(results$low_acid_ratios %||% data.frame()),
+    volume_issue_records = nrow(results$volume_issues),
+    quality_log_issues = nrow(results$quality_log_issues %||% data.frame()),
+    missing_fraction_collections = nrow(results$missing_fractions),
+    replicated_hakai_ids = length(unique((results$replicated_ids %||% data.frame())$hakai_id)),
+    calibration_combinations = nrow(results$calibration_summary)
+  ))
   
-  # Define calibration-related columns to check
-  calibration_cols <- c("flurometer_serial_no", "calibration", "acid_ratio_correction_factor", 
-                        "acid_coefficient", "calibration_slope")
-  
-  # Check which calibration columns are available
-  available_cal_cols <- calibration_cols[calibration_cols %in% names(data)]
-  missing_cal_cols <- calibration_cols[!calibration_cols %in% names(data)]
-  
-  if (length(missing_cal_cols) > 0) {
-    cat("WARNING: Missing calibration columns:", paste(missing_cal_cols, collapse = ", "), "\n")
-  }
-  
-  if (length(available_cal_cols) > 0) {
-    cat("Checking calibration consistency for columns:", paste(available_cal_cols, collapse = ", "), "\n\n")
-    
-    # Check if we have flurometer_serial_no for grouping
-    if ("flurometer_serial_no" %in% available_cal_cols) {
-      
-      # Create calibration summary by fluorometer serial number - include analyzed dates
-      calibration_summary <- data %>%
-        filter(!is.na(date)) %>%
-        select(date, all_of(available_cal_cols), any_of("analyzed")) %>%
-        # Remove rows where all calibration values are NA
-        filter(if_all(all_of(available_cal_cols), ~ !is.na(.))) %>%
-        arrange(date) %>%
-        # Group by fluorometer serial number first, then by calibration parameters
-        group_by(flurometer_serial_no) %>%
-        nest() %>%
-        mutate(
-          calibration_periods = map(data, ~ {
-            summary_data <- .x %>%
-              group_by(across(all_of(available_cal_cols[available_cal_cols != "flurometer_serial_no"]))) %>%
-              summarise(
-                start_date = min(date, na.rm = TRUE),
-                end_date = max(date, na.rm = TRUE),
-                n_records = n(),
-                date_range = paste(min(date, na.rm = TRUE), "to", max(date, na.rm = TRUE)),
-                .groups = 'drop'
-              )
-            
-            # Add analyzed date columns if analyzed column exists
-            if ("analyzed" %in% names(.x)) {
-              summary_data <- .x %>%
-                group_by(across(all_of(available_cal_cols[available_cal_cols != "flurometer_serial_no"]))) %>%
-                summarise(
-                  start_date = min(date, na.rm = TRUE),
-                  end_date = max(date, na.rm = TRUE),
-                  start_analyzed = min(as.Date(analyzed), na.rm = TRUE),
-                  end_analyzed = max(as.Date(analyzed), na.rm = TRUE),
-                  n_records = n(),
-                  date_range = paste(min(date, na.rm = TRUE), "to", max(date, na.rm = TRUE)),
-                  analyzed_range = paste(min(as.Date(analyzed), na.rm = TRUE), "to", max(as.Date(analyzed), na.rm = TRUE)),
-                  .groups = 'drop'
-                )
-            }
-            
-            summary_data %>% arrange(if ("start_analyzed" %in% names(.)) start_analyzed else start_date)
-          })
-        ) %>%
-        select(-data) %>%
-        unnest(calibration_periods)
-      
-      if (nrow(calibration_summary) > 0) {
-        cat("Calibration periods by fluorometer serial number:\n")
-        
-        # Print summary for each fluorometer
-        for (serial_num in unique(calibration_summary$flurometer_serial_no)) {
-          cat("\n--- Fluorometer Serial Number:", serial_num, "---\n")
-          serial_data <- calibration_summary %>% filter(flurometer_serial_no == serial_num)
-          print(serial_data %>% select(-flurometer_serial_no))
-        }
-        
-        # Check for calibration date issues if calibration column exists
-        calibration_date_issues <- NULL
-        if ("calibration" %in% available_cal_cols && "analyzed" %in% names(data)) {
-          cat("\n=== CALIBRATION DATE VALIDATION ===\n")
-          
-          # Use the already computed calibration_summary for date validation
-          calibration_date_issues <- calibration_summary %>%
-            mutate(
-              calibration_date = as.Date(calibration, tryFormats = c("%Y-%m-%d", "%m/%d/%Y", "%d/%m/%Y")),
-              date_issue = !is.na(calibration_date) & start_analyzed < calibration_date
-            ) %>%
-            filter(date_issue == TRUE) %>%
-            select(flurometer_serial_no, calibration, calibration_date, start_analyzed, end_analyzed,
-                   start_date, end_date, n_records, everything())
-          
-          if (nrow(calibration_date_issues) > 0) {
-            cat("WARNING: Found", nrow(calibration_date_issues), "calibration periods where analyzed date is before calibration date:\n")
-            print(calibration_date_issues)
-            
-            # Create issues directory if it doesn't exist
-            if (!dir.exists(here("issues"))) {
-              dir.create(here("issues"), recursive = TRUE)
-            }
-            
-            # Save to CSV
-            csv_filename <- here("issues", paste0("calibration_date_issues_", Sys.Date(), ".csv"))
-            write.csv(calibration_date_issues, csv_filename, row.names = FALSE)
-            cat("Calibration date issues saved to:", csv_filename, "\n")
-            
-          } else {
-            cat("No calibration date issues found (analyzed dates are after calibration dates).\n")
-          }
-          
-        } else if ("calibration" %in% available_cal_cols && !"analyzed" %in% names(data)) {
-          cat("\n=== CALIBRATION DATE VALIDATION ===\n")
-          cat("WARNING: 'analyzed' column not found. Cannot perform calibration date validation.\n")
-          cat("Available date columns:", paste(names(data)[grepl("date|time|analyzed", names(data), ignore.case = TRUE)], collapse = ", "), "\n")
-        }
-        
-      } else {
-        cat("No complete calibration records found in the data.\n")
-      }
-      
-    } else {
-      cat("Cannot perform fluorometer-specific analysis: flurometer_serial_no column not found.\n")
-      calibration_summary <- data.frame()
-    }
-    
-  } else {
-    cat("No calibration columns found in the data.\n")
-    calibration_summary <- data.frame()
-  }
-  
-  # Summary statistics
-  cat("\n=== SUMMARY ===\n")
-  cat("Total records processed:", nrow(data), "\n")
-  cat("Records with negative values:", nrow(negative_values), "\n")
-  if (exists("low_acid_ratios")) {
-    cat("Records with low acid ratios:", nrow(low_acid_ratios), "\n")
-  }
-  if (exists("missing_fractions")) {
-    cat("Collection times missing size fractions:", nrow(missing_fractions), "\n")
-  }
-  if (exists("replicated_ids")) {
-    cat("Replicated hakai_id values:", length(unique(replicated_ids$hakai_id)), "\n")
-  }
-  if (exists("calibration_summary")) {
-    cat("Distinct calibration combinations:", nrow(calibration_summary), "\n")
-  }
-  
-  # Return results as a list
-  results <- list(
-    negative_values = negative_values,
-    summary_stats = list(
-      total_records = nrow(data),
-      negative_records = nrow(negative_values)
-    )
-  )
-  
-  if (exists("low_acid_ratios")) {
-    results$low_acid_ratios <- low_acid_ratios
-    results$summary_stats$low_acid_ratio_records <- nrow(low_acid_ratios)
-  }
-  
-  if (exists("missing_fractions")) {
-    results$missing_fractions <- missing_fractions
-    results$summary_stats$missing_fraction_collections <- nrow(missing_fractions)
-  }
-  
-  if (exists("replicated_ids")) {
-    results$replicated_ids <- replicated_ids
-    results$summary_stats$replicated_hakai_ids <- length(unique(replicated_ids$hakai_id))
-  }
-  
-  if (exists("calibration_summary")) {
-    results$calibration_summary <- calibration_summary
-    results$summary_stats$calibration_combinations <- nrow(calibration_summary)
-  }
-  
-  if (exists("calibration_date_issues") && !is.null(calibration_date_issues)) {
-    results$calibration_date_issues <- calibration_date_issues
-    results$summary_stats$calibration_date_issues <- nrow(calibration_date_issues)
-  }
+  # Print summary
+  cat("=== SUMMARY ===\n")
+  cat("Total records processed:", results$summary_stats$total_records, "\n")
+  cat("Records with negative values:", results$summary_stats$negative_records, "\n")
+  cat("Records with low acid ratios:", results$summary_stats$low_acid_ratio_records, "\n")
+  cat("Records with volume issues:", results$summary_stats$volume_issue_records, "\n")
+  cat("Records with quality log issues:", results$summary_stats$quality_log_issues, "\n")
+  cat("Collection times missing size fractions:", results$summary_stats$missing_fraction_collections, "\n")
+  cat("Replicated hakai_id values:", results$summary_stats$replicated_hakai_ids, "\n")
+  cat("Distinct calibration combinations:", results$summary_stats$calibration_combinations, "\n")
   
   return(results)
 }
-
 #---------------------------------------------------------------------------
 
 
@@ -1514,4 +1348,231 @@ create_monthly_boxplot_qc <- function(data, selected_depth = NULL, selected_filt
   return(list(plot = p, outlier_data = investigation_with_outliers, monthly_stats = monthly_stats))
 }
 
+# ----------------------------------------------------------------------------
 
+#Code for HPLC comparisons - not sure if this is useful.
+
+# HPLC Chlorophyll Comparison Function for QC Workflow
+# Author: Biological Oceanography QC Tool
+# Purpose: Compare Fluorophotometric vs HPLC chlorophyll measurements
+
+#' Compare chlorophyll-a measurements between Fluorophotometry and HPLC
+#' 
+#' @param data Dataframe with Fluorophotometric chlorophyll data
+#' @param data_hplc Dataframe with HPLC chlorophyll data  
+#' @param selected_year Numeric year to highlight (optional)
+#' @param interactive Logical, create interactive plot (default TRUE)
+#' @param show_annual_stats Logical, display annual regression statistics (default TRUE)
+#' @return ggplot or plotly object depending on interactive parameter
+
+hplc_compare_plot <- function(data, data_hplc, selected_year = NULL, 
+                              interactive = TRUE, show_annual_stats = TRUE) {
+  
+  # Load required libraries
+  require(dplyr)
+  require(ggplot2)
+  require(plotly)
+  require(lubridate)
+  
+  # Data processing
+  message("Processing data...")
+  
+  # Filter and join datasets
+  data_filtered <- data %>%
+    filter(filter_type == "Bulk GF/F")
+  
+  combined_data <- data_filtered %>%
+    inner_join(data_hplc, 
+               by = c("collected", "site_id", "line_out_depth"),
+               suffix = c("_chla", "_hplc")) %>%
+    # Remove samples with SVD flags (but keep NA flags)
+    filter((is.na(chla_flag) | chla_flag != "SVD") & 
+             (is.na(all_chl_a_flag) | all_chl_a_flag != "SVD")) %>%
+    # Extract year from date
+    mutate(
+      year_chla = year(date_chla),
+      year_hplc = year(date_hplc),
+      year = year_chla
+    ) %>%
+    # Remove rows with missing chlorophyll values
+    filter(!is.na(chla) & !is.na(all_chl_a))
+  
+  if(nrow(combined_data) == 0) {
+    stop("No data remaining after filtering. Check your datasets and filter criteria.")
+  }
+  
+  # Calculate baseline regression (all data)
+  baseline_model <- lm(all_chl_a ~ chla, data = combined_data)
+  baseline_summary <- summary(baseline_model)
+  
+  # Create prediction intervals for baseline
+  chla_range <- seq(min(combined_data$chla, na.rm = TRUE), 
+                    max(combined_data$chla, na.rm = TRUE), 
+                    length.out = 100)
+  baseline_pred <- predict(baseline_model, 
+                           newdata = data.frame(chla = chla_range), 
+                           interval = "confidence", 
+                           level = 0.95)
+  
+  baseline_bands <- data.frame(
+    chla = chla_range,
+    fit = baseline_pred[, "fit"],
+    lwr = baseline_pred[, "lwr"],
+    upr = baseline_pred[, "upr"]
+  )
+  
+  # Annual regression if year is selected
+  annual_model <- NULL
+  annual_summary <- NULL
+  annual_bands <- NULL
+  year_data <- NULL
+  
+  if (!is.null(selected_year)) {
+    year_data <- combined_data %>% filter(year == selected_year)
+    
+    if (nrow(year_data) >= 3) {  # Need at least 3 points for regression
+      annual_model <- lm(all_chl_a ~ chla, data = year_data)
+      annual_summary <- summary(annual_model)
+      
+      # Create prediction intervals for annual regression
+      if (nrow(year_data) > 0) {
+        annual_pred <- predict(annual_model, 
+                               newdata = data.frame(chla = chla_range), 
+                               interval = "confidence", 
+                               level = 0.95)
+        annual_bands <- data.frame(
+          chla = chla_range,
+          fit = annual_pred[, "fit"],
+          lwr = annual_pred[, "lwr"],
+          upr = annual_pred[, "upr"]
+        )
+      }
+    }
+  }
+  
+  # Determine axis limits
+  max_val <- max(c(combined_data$chla, combined_data$all_chl_a), na.rm = TRUE)
+  min_val <- min(c(combined_data$chla, combined_data$all_chl_a), na.rm = TRUE)
+  
+  # Create plot
+  p <- ggplot() +
+    # Baseline confidence bands
+    geom_ribbon(data = baseline_bands, 
+                aes(x = chla, ymin = lwr, ymax = upr), 
+                alpha = 0.2, fill = "blue") +
+    
+    # Annual confidence bands (if available)
+    {if (!is.null(annual_bands)) {
+      geom_ribbon(data = annual_bands, 
+                  aes(x = chla, ymin = lwr, ymax = upr), 
+                  alpha = 0.3, fill = "darkgreen")
+    }} +
+    
+    # 1:1 line
+    geom_abline(intercept = 0, slope = 1, 
+                color = "red", linetype = "dashed", size = 1) +
+    
+    # Baseline regression line
+    geom_line(data = baseline_bands, 
+              aes(x = chla, y = fit), 
+              color = "blue", size = 1.2) +
+    
+    # Annual regression line (if available)
+    {if (!is.null(annual_bands)) {
+      geom_line(data = annual_bands, 
+                aes(x = chla, y = fit), 
+                color = "darkgreen", size = 1.2)
+    }} +
+    
+    # All data points (baseline)
+    geom_point(data = combined_data, 
+               aes(x = chla, y = all_chl_a, 
+                   text = paste("Date (chla):", date_chla, 
+                                "<br>Date (HPLC):", date_hplc,
+                                "<br>Site:", site_id,
+                                "<br>Depth:", line_out_depth,
+                                "<br>Chl-a:", round(chla, 3),
+                                "<br>All Chl-a:", round(all_chl_a, 3),
+                                "<br>Year:", year)), 
+               alpha = 0.4, color = "gray60", size = 1.5) +
+    
+    # Selected year points (if specified)
+    {if (!is.null(year_data) && nrow(year_data) > 0) {
+      geom_point(data = year_data, 
+                 aes(x = chla, y = all_chl_a,
+                     text = paste("Date (chla):", date_chla, 
+                                  "<br>Date (HPLC):", date_hplc,
+                                  "<br>Site:", site_id,
+                                  "<br>Depth:", line_out_depth,
+                                  "<br>Chl-a:", round(chla, 3),
+                                  "<br>All Chl-a:", round(all_chl_a, 3),
+                                  "<br>Year:", year)), 
+                 color = "darkgreen", size = 2.5, alpha = 0.9)
+    }} +
+    
+    # Labels and formatting
+    labs(
+      x = "Chlorophyll-a (μg/L) - Fluorometric",
+      y = "All Chlorophyll-a (μg/L) - HPLC",
+      title = ifelse(!is.null(selected_year), 
+                     paste("Chlorophyll Comparison: Year", selected_year, "vs Baseline"),
+                     "Chlorophyll Comparison: All Years"),
+      caption = paste("Red dashed: 1:1 line | Blue: Baseline regression ± 95% CI",
+                      ifelse(!is.null(selected_year), "| Green: Annual regression ± 95% CI", ""))
+    ) +
+    
+    coord_fixed(ratio = 1, xlim = c(min_val, max_val * 1.05), 
+                ylim = c(min_val, max_val * 1.05)) +
+    
+    theme_minimal() +
+    theme(
+      plot.title = element_text(size = 14, face = "bold"),
+      plot.caption = element_text(size = 10),
+      axis.title = element_text(size = 12),
+      legend.position = "none"
+    )
+  
+  # Print statistics
+  available_years <- sort(unique(combined_data$year))
+  
+  cat("\n=== HPLC vs Fluorophotometric Chlorophyll Comparison ===\n")
+  cat("Total samples after filtering:", nrow(combined_data), "\n")
+  cat("Available years:", paste(available_years, collapse = ", "), "\n\n")
+  
+  cat("BASELINE REGRESSION (All Data):\n")
+  cat("Equation: HPLC = ", round(coef(baseline_model)[1], 4), " + ", 
+      round(coef(baseline_model)[2], 4), " × Fluoro\n", sep="")
+  cat("R²:", round(baseline_summary$r.squared, 4), "\n")
+  cat("RMSE:", round(sqrt(mean(baseline_model$residuals^2)), 4), "\n")
+  cat("Correlation:", round(cor(combined_data$chla, combined_data$all_chl_a), 4), "\n")
+  cat("p-value:", format.pval(baseline_summary$coefficients[2,4]), "\n\n")
+  
+  if (!is.null(selected_year) && !is.null(annual_model) && show_annual_stats) {
+    cat("ANNUAL REGRESSION (", selected_year, "):\n", sep="")
+    cat("Samples:", nrow(year_data), "\n")
+    cat("Equation: HPLC = ", round(coef(annual_model)[1], 4), " + ", 
+        round(coef(annual_model)[2], 4), " × Fluoro\n", sep="")
+    cat("R²:", round(annual_summary$r.squared, 4), "\n")
+    cat("RMSE:", round(sqrt(mean(annual_model$residuals^2)), 4), "\n")
+    cat("Correlation:", round(cor(year_data$chla, year_data$all_chl_a), 4), "\n")
+    cat("p-value:", format.pval(annual_summary$coefficients[2,4]), "\n")
+    
+    # Compare slopes
+    slope_diff <- coef(annual_model)[2] - coef(baseline_model)[2]
+    cat("Slope difference from baseline:", round(slope_diff, 4), "\n\n")
+  }
+  
+  # Return plot
+  if (interactive) {
+    return(ggplotly(p, tooltip = "text") %>%
+             layout(title = list(text = p$labels$title, font = list(size = 16))))
+  } else {
+    return(p)
+  }
+}
+
+# Convenience function for quick year comparisons
+quick_year_compare <- function(data, data_hplc, year) {
+  return(hplc_compare_plot(data, data_hplc, selected_year = year, 
+                           interactive = TRUE, show_annual_stats = TRUE))
+}
